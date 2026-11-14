@@ -1,0 +1,3199 @@
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import NotesNotebook, { clearNotebookStorage } from "./NotesNotebook";
+import { DESIGNS, DESIGN_GROUPS, DEFAULT_DESIGN, designById, isDesignId, type DesignId } from "./designs";
+import MotionFx from "./MotionFx";
+import { inkOn, lightnessFor, luminance } from "./accent";
+import { playAttentionWarning, playUi, soundSupported } from "./sound";
+import AttentionGuardPanel, { AttentionCameraIndicator } from "./attention-guard/AttentionGuardPanel";
+import { AttentionGuardController } from "./attention-guard/controller";
+import { isActiveFocusTimer, shouldPauseFocusTimer } from "./attention-guard/lifecycle";
+import { activeAttentionProfile, clearAttentionStore } from "./attention-guard/storage";
+import { secondsRemaining } from "./timerMath";
+import { useAttentionStore } from "./attention-guard/useAttentionStore";
+
+const PdfViewer = lazy(() => import("./PdfViewer"));
+const WebReader = lazy(() => import("./WebReader"));
+const YouTubeAudioPlayer = lazy(() => import("./YouTubeAudioPlayer"));
+
+type ModeId = "focus" | "short" | "long";
+type PanelId = "tasks" | "music" | "personal" | "stats" | "notes" | "settings" | "attention";
+type UtilId = "youtube" | "web" | "files";
+type FileKind = "text" | "image" | "video" | "audio" | "pdf" | "other";
+type LocalFile = { id: string; name: string; type: string; url: string; kind: FileKind; text?: string; data?: ArrayBuffer };
+type SceneId = "cabin" | "rain" | "forest" | "ocean" | "dawn" | "pure";
+type PersonalTab = "scenes" | "themes" | "arrangement";
+type BuiltInArrangementId = "classic" | "timer-left" | "timer-right";
+type StageItemId = "modes" | "timer" | "controls" | "task";
+type LayoutPoint = { x: number; y: number };
+type LayoutPositions = Record<StageItemId, LayoutPoint>;
+type CustomArrangement = { id: string; name: string; positions: LayoutPositions };
+
+type Task = { id: string; text: string; done: boolean; pomosDone: number; createdAt: number; scheduledFor?: string };
+/* Time is accrued live, second by second, into three buckets:
+     focusSec  — clock running in a focus segment
+     breakSec  — clock running in a short/long break (leisure)
+     idleSec   — app open but nothing running (Misc / Unproductive)
+   Legacy saves stored whole minutes only; they are migrated on load. */
+type DayStat = {
+  focusSec: number;
+  breakSec: number;
+  idleSec: number;
+  sessions: number;
+  skippedFocus: number;
+};
+
+const emptyDay = (): DayStat => ({ focusSec: 0, breakSec: 0, idleSec: 0, sessions: 0, skippedFocus: 0 });
+type WinFrame = { x: number; y: number; w: number; h: number; full: boolean };
+
+type Settings = {
+  name: string;
+  focusMinutes: number;
+  shortMinutes: number;
+  longMinutes: number;
+  sessionsBeforeLong: number;
+  autoStartBreaks: boolean;
+  autoStartFocus: boolean;
+  clock24h: boolean;
+  checkIns: boolean;
+  checkInMinutes: number;
+  /** Interface clicks — a different synthesised voice per theme. */
+  uiSound: boolean;
+  /** Wash the wallpaper toward the theme's own colour. Off = the picture,
+      untouched, with only a neutral scrim where type sits on it. */
+  wallTint: boolean;
+};
+
+type AppState = {
+  settings: Settings;
+  mode: ModeId;
+  remaining: number;
+  sessionsDone: number;
+  tasks: Task[];
+  activeTaskId: string | null;
+  notes: string;
+  stats: Record<string, DayStat>;
+  scene: SceneId;
+  sceneAuto: boolean;
+  /** True once the user has actually picked a scene, so picking "cabin" (the
+      default) still counts as choosing a wallpaper. */
+  sceneExplicit: boolean;
+  customImage: string;
+  customYoutube: string;
+  studyVideo: string;
+  spotify: { type: string; id: string } | null;
+  youtubeMusicUrl: string;
+  /** Active design orientation. "classic" is the original look. */
+  design: DesignId;
+  /** Timer/control arrangement, plus user-saved draggable layouts. */
+  arrangement: string;
+  customArrangements: CustomArrangement[];
+  /** Manual accent override (0-359), remembered per theme. A missing entry
+      means "use the theme's own palette" (which itself may follow the scene). */
+  designHues: Partial<Record<DesignId, number>>;
+  windows: Record<string, WinFrame>;
+};
+
+const STORE_KEY = "focusdash_react_v6";
+const PREV_STORE_KEY = "focusdash_react_v5";
+const MODE_IDS: ModeId[] = ["focus", "short", "long"];
+// Currently-active Lofi Girl radio. Users can always paste their own link.
+const DEFAULT_STUDY_VIDEO = "https://www.youtube.com/watch?v=X4VbdwhkE10";
+
+/* Curated accent swatches for the custom theme picker — spread evenly around
+   the hue wheel at a saturation/lightness that always looks good against the
+   dark UI, matching the same formula used for scene-driven accents. */
+const THEME_SWATCHES = [
+  "#f2545b", "#f5875f", "#f5b74f", "#e3ce55",
+  "#a4d65e", "#4fd18b", "#43d0c0", "#4fb8f0",
+  "#5c8df6", "#8b6ef2", "#c25ce0", "#f25ca0",
+];
+
+const modeLabels: Record<ModeId, string> = {
+  focus: "Focus",
+  short: "Short Break",
+  long: "Long Break",
+};
+
+const sceneLabels: Record<SceneId, string> = {
+  cabin: "Winter Cabin",
+  rain: "Rainlight",
+  forest: "Forest Hush",
+  ocean: "Ocean Deep",
+  dawn: "Dawn Quiet",
+  pure: "Pure Black",
+};
+
+const SCENE_IMAGES: Record<SceneId, string> = {
+  cabin: "https://images.pexels.com/photos/15508361/pexels-photo-15508361.jpeg?auto=compress&cs=tinysrgb&fit=crop&h=900&w=1600",
+  rain: "https://images.pexels.com/photos/459451/pexels-photo-459451.jpeg?auto=compress&cs=tinysrgb&fit=crop&h=900&w=1600",
+  forest: "https://images.pexels.com/photos/142497/pexels-photo-142497.jpeg?auto=compress&cs=tinysrgb&fit=crop&h=900&w=1600",
+  ocean: "https://images.pexels.com/photos/355288/pexels-photo-355288.jpeg?auto=compress&cs=tinysrgb&fit=crop&h=900&w=1600",
+  dawn: "https://images.pexels.com/photos/210186/pexels-photo-210186.jpeg?auto=compress&cs=tinysrgb&fit=crop&h=900&w=1600",
+  pure: "",
+};
+
+/* Preset ids that have been renamed. Saved state is rewritten on load so an
+   existing theme pick (and its accent override) survives. */
+/* Presets that were folded into a stronger one keep working: a saved id maps to
+   the closest surviving theme instead of silently falling back to Original. */
+const LEGACY_DESIGN_IDS: Record<string, DesignId> = {
+  anime: "kaleido",
+  aurora: "vaporwave",
+  nordic: "ocean",
+  forest: "botanical",
+  minimal: "swiss",
+  golden: "sunset",
+  arctic: "ocean",
+  desert: "sunset",
+  tech: "terminal",
+  galaxy: "vaporwave",
+};
+
+/* The scene that ships with the app; picking anything else counts as choosing a
+   wallpaper, which is shown behind every theme. */
+const DEFAULT_SCENE: SceneId = "cabin";
+
+/* Fallback accent hue per scene, used until (or if) the image sample succeeds */
+const SCENE_HUES: Record<SceneId, number> = {
+  cabin: 32,
+  rain: 214,
+  forest: 142,
+  ocean: 192,
+  dawn: 338,
+  pure: 42,
+};
+
+const quotes = [
+  "Great results require great ambitions.",
+  "The task is smaller than the dread of starting it.",
+  "Depth over speed.",
+  "Discipline is choosing between what you want now and what you want most.",
+  "You don't have to see the whole staircase, just take the first step.",
+  "Motivation gets you started. Habit keeps you going.",
+  "Small steps every day add up to big results.",
+  "The pain of discipline weighs ounces; the pain of regret weighs tons.",
+  "Do the hard things while they are still easy.",
+  "What you do today can improve all your tomorrows.",
+  "Action is the antidote to despair.",
+  "The expert in anything was once a beginner.",
+  "Hard choices, easy life. Easy choices, hard life.",
+  "You are never too tired to at least start.",
+  "Focus on being productive instead of busy.",
+  "The secret of getting ahead is getting started.",
+  "A year from now you will wish you had started today.",
+  "Progress, not perfection.",
+  "Success is the sum of small efforts repeated daily.",
+  "Nothing worth having comes easy.",
+  "You don't find willpower, you build it.",
+  "Do something today that your future self will thank you for.",
+  "The only bad workout is the one that didn't happen.",
+  "Slow progress is still progress.",
+  "It always seems impossible until it is done.",
+  "Well begun is half done.",
+  "Energy and persistence conquer all things.",
+  "The way to get started is to quit talking and begin doing.",
+  "Don't watch the clock; do what it does — keep going.",
+  "Believe you can and you're halfway there.",
+  "There is no substitute for hard work.",
+  "You are capable of more than you know.",
+  "Every accomplishment starts with the decision to try.",
+  "Push yourself, because no one else is going to do it for you.",
+  "Great things never came from comfort zones.",
+  "Success doesn't just find you. You have to go out and get it.",
+  "The harder you work for something, the greater you'll feel when you achieve it.",
+  "Dream bigger. Do bigger.",
+  "Don't stop when you're tired. Stop when you're done.",
+  "Wake up with determination. Go to bed with satisfaction.",
+  "Do something today that your future self will thank you for.",
+  "Little things make big days.",
+  "It's going to be hard, but hard does not mean impossible.",
+  "Don't wait for opportunity. Create it.",
+  "Sometimes we're tested not to show our weaknesses, but to discover our strengths.",
+  "The key to success is to focus on goals, not obstacles.",
+  "Dream it. Wish it. Do it.",
+  "Strive for progress, not perfection.",
+  "You are your only limit.",
+  "Difficult roads often lead to beautiful destinations.",
+  "Work hard in silence, let success make the noise.",
+  "Your only limit is your mind.",
+  "Good things come to those who hustle.",
+  "The future depends on what you do today.",
+  "Clarity comes from engagement, not thought.",
+  "Consistency is what transforms average into excellence.",
+  "One day or day one — you decide.",
+  "Success is built one focused hour at a time.",
+  "You didn't come this far to only come this far.",
+  "The comeback is always stronger than the setback.",
+  "Doubt kills more dreams than failure ever will.",
+  "What seems impossible today will one day become your warm-up.",
+  "Champions keep playing until they get it right.",
+  "Excellence is not an act but a habit.",
+  "The best way out is always through.",
+  "Fall seven times, stand up eight.",
+  "Effort is never wasted.",
+  "Be so good they can't ignore you.",
+  "You get in life what you have the courage to ask for.",
+  "Don't count the days, make the days count.",
+  "Whatever you are, be a good one.",
+  "The struggle you're in today is developing the strength you need tomorrow.",
+  "Start where you are. Use what you have. Do what you can.",
+  "Discomfort today builds strength for tomorrow.",
+];
+
+/* Short taglines shown directly under the clock — one per phase, picked at
+   random whenever the mode changes so the app never repeats itself. */
+const FOCUS_LINES = [
+  "Focus. Work hard.",
+  "Eyes on the task.",
+  "One thing at a time.",
+  "Deep work mode.",
+  "Quiet mind, sharp focus.",
+  "This is your hour.",
+  "No distractions. Just work.",
+  "Head down. Get it done.",
+  "Single task. Full attention.",
+  "Make this session count.",
+];
+const SHORT_BREAK_LINES = [
+  "Breathe, reset, return clean.",
+  "Stretch. Sip water. Reset.",
+  "Small pause, big reset.",
+  "Rest the mind, not the momentum.",
+  "Step away for a moment.",
+  "Shake it out. Come back sharp.",
+];
+const LONG_BREAK_LINES = [
+  "Well earned. Recharge fully.",
+  "Cycle complete. Take your time.",
+  "Rest deep — you've done the work.",
+  "A real break. You've earned it.",
+  "Reset completely before the next round.",
+];
+
+function pickRandom<T>(list: T[]): T {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+function phaseLinesFor(mode: ModeId): string[] {
+  if (mode === "short") return SHORT_BREAK_LINES;
+  if (mode === "long") return LONG_BREAK_LINES;
+  return FOCUS_LINES;
+}
+
+const BUILT_IN_ARRANGEMENTS: { id: BuiltInArrangementId; name: string; description: string }[] = [
+  { id: "classic", name: "Centered", description: "Default · the original, balanced stack." },
+  { id: "timer-left", name: "Timer left", description: "Timer on the left, controls stacked right." },
+  { id: "timer-right", name: "Timer right", description: "Controls stacked left, timer on the right." },
+];
+
+const STAGE_ITEM_IDS: StageItemId[] = ["modes", "timer", "controls", "task"];
+const DEFAULT_LAYOUT_POSITIONS: LayoutPositions = {
+  modes: { x: 50, y: 15 },
+  timer: { x: 50, y: 42 },
+  controls: { x: 50, y: 69 },
+  task: { x: 50, y: 87 },
+};
+const EDIT_START_POSITIONS: Record<BuiltInArrangementId, LayoutPositions> = {
+  classic: DEFAULT_LAYOUT_POSITIONS,
+  "timer-left": {
+    modes: { x: 50, y: 15 },
+    timer: { x: 29, y: 51 },
+    controls: { x: 82, y: 51 },
+    task: { x: 29, y: 85 },
+  },
+  "timer-right": {
+    modes: { x: 50, y: 15 },
+    controls: { x: 18, y: 51 },
+    timer: { x: 71, y: 51 },
+    task: { x: 71, y: 85 },
+  },
+};
+
+const defaultState = (): AppState => ({
+  settings: {
+    name: "",
+    focusMinutes: 25,
+    shortMinutes: 5,
+    longMinutes: 15,
+    // Standard Pomodoro cycle: 4 focus sessions, then a long break.
+    sessionsBeforeLong: 4,
+    autoStartBreaks: true,
+    autoStartFocus: false,
+    clock24h: true,
+    checkIns: false,
+    checkInMinutes: 12,
+    uiSound: true,
+    wallTint: true,
+  },
+  mode: "focus",
+  remaining: 25 * 60,
+  sessionsDone: 0,
+  tasks: [],
+  activeTaskId: null,
+  notes: "",
+  stats: {},
+  scene: DEFAULT_SCENE,
+  sceneAuto: false,
+  sceneExplicit: false,
+  customImage: "",
+  customYoutube: "",
+  studyVideo: DEFAULT_STUDY_VIDEO,
+  spotify: null,
+  youtubeMusicUrl: "",
+  design: DEFAULT_DESIGN,
+  arrangement: "classic",
+  customArrangements: [],
+  designHues: {},
+  windows: {},
+});
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function cloneLayoutPositions(positions: LayoutPositions): LayoutPositions {
+  return {
+    modes: { ...positions.modes },
+    timer: { ...positions.timer },
+    controls: { ...positions.controls },
+    task: { ...positions.task },
+  };
+}
+
+function isBuiltInArrangementId(value: unknown): value is BuiltInArrangementId {
+  return value === "classic" || value === "timer-left" || value === "timer-right";
+}
+
+function normalizeLayoutPoint(value: unknown, fallback: LayoutPoint): LayoutPoint {
+  const point = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const x = typeof point.x === "number" && Number.isFinite(point.x) ? point.x : fallback.x;
+  const y = typeof point.y === "number" && Number.isFinite(point.y) ? point.y : fallback.y;
+  return { x: clamp(x, 4, 96), y: clamp(y, 5, 95) };
+}
+
+function normalizeCustomArrangements(value: unknown): CustomArrangement[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.slice(0, 24).flatMap((entry): CustomArrangement[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || !candidate.id.startsWith("custom-") || seen.has(candidate.id)) return [];
+    seen.add(candidate.id);
+    const positions = candidate.positions && typeof candidate.positions === "object"
+      ? candidate.positions as Record<string, unknown>
+      : {};
+    const name = typeof candidate.name === "string" ? candidate.name.trim().slice(0, 32) : "";
+    return [{
+      id: candidate.id.slice(0, 100),
+      name: name || "Custom layout",
+      positions: {
+        modes: normalizeLayoutPoint(positions.modes, DEFAULT_LAYOUT_POSITIONS.modes),
+        timer: normalizeLayoutPoint(positions.timer, DEFAULT_LAYOUT_POSITIONS.timer),
+        controls: normalizeLayoutPoint(positions.controls, DEFAULT_LAYOUT_POSITIONS.controls),
+        task: normalizeLayoutPoint(positions.task, DEFAULT_LAYOUT_POSITIONS.task),
+      },
+    }];
+  });
+}
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+function todayKey(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** Parse calendar dates at local noon to avoid UTC and DST day shifts. */
+function localDateFromKey(key: string) {
+  const [year, month, day] = key.split("-").map(Number);
+  return new Date(year, month - 1, day, 12);
+}
+
+function isLocalDateKey(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = localDateFromKey(value);
+  return Number.isFinite(date.getTime()) && todayKey(date) === value;
+}
+
+function addDaysToKey(key: string, days: number) {
+  const date = localDateFromKey(key);
+  date.setDate(date.getDate() + days);
+  return todayKey(date);
+}
+
+function addMonthsToKey(key: string, months: number) {
+  const date = localDateFromKey(key);
+  const day = date.getDate();
+  date.setDate(1);
+  date.setMonth(date.getMonth() + months);
+  const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0, 12).getDate();
+  date.setDate(Math.min(day, lastDay));
+  return todayKey(date);
+}
+
+function mondayOfWeek(key: string) {
+  const date = localDateFromKey(key);
+  date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+  return todayKey(date);
+}
+
+function formatTaskDate(key: string) {
+  if (key === todayKey()) return "Today";
+  if (key === addDaysToKey(todayKey(), 1)) return "Tomorrow";
+  return localDateFromKey(key).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatLongDate(key: string) {
+  return localDateFromKey(key).toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+function defaultFrame(wide = false): WinFrame {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const w = Math.min(wide ? 540 : 390, vw - 20);
+  const h = Math.min(wide ? 580 : 500, Math.max(380, vh * 0.7));
+  return {
+    x: Math.max(10, (vw - w) / 2),
+    y: Math.max(12, Math.min(84, (vh - h) / 2 - 48)),
+    w,
+    h,
+    full: false,
+  };
+}
+
+function secondsFor(mode: ModeId, state: AppState) {
+  if (mode === "short") return state.settings.shortMinutes * 60;
+  if (mode === "long") return state.settings.longMinutes * 60;
+  return state.settings.focusMinutes * 60;
+}
+
+function loadState(): AppState {
+  try {
+    let raw = localStorage.getItem(STORE_KEY);
+    let legacy = !raw;
+    if (!raw) raw = localStorage.getItem(PREV_STORE_KEY);
+    if (!raw) return defaultState();
+    const base = defaultState();
+    const parsed = JSON.parse(raw) as Partial<AppState> & { mode?: string; remaining?: number };
+
+    const customArrangements = normalizeCustomArrangements(parsed.customArrangements);
+    const savedArrangement = typeof parsed.arrangement === "string" ? parsed.arrangement : "classic";
+    const arrangement = isBuiltInArrangementId(savedArrangement) || customArrangements.some((item) => item.id === savedArrangement)
+      ? savedArrangement
+      : "classic";
+    const settings = { ...base.settings, ...(parsed.settings ?? {}) };
+    if (legacy) {
+      // Older saves used a different cycle length — adopt the standard 4-session Pomodoro cycle.
+      settings.sessionsBeforeLong = 4;
+    }
+    const merged: AppState = {
+      ...base,
+      ...parsed,
+      settings,
+      notes: typeof parsed.notes === "string" ? parsed.notes : "",
+      tasks: Array.isArray(parsed.tasks)
+        ? parsed.tasks.map((task) => ({
+            ...task,
+            scheduledFor: isLocalDateKey(task.scheduledFor) ? task.scheduledFor : undefined,
+          }))
+        : base.tasks,
+      windows: { ...(parsed.windows ?? {}) },
+      arrangement,
+      customArrangements,
+      spotify: parsed.spotify ?? null,
+      youtubeMusicUrl: parsed.youtubeMusicUrl ?? "",
+      mode: (MODE_IDS.includes(parsed.mode as ModeId) ? parsed.mode : "focus") as ModeId,
+      // Presets get renamed occasionally — map the old ids across.
+      design: isDesignId(LEGACY_DESIGN_IDS[parsed.design as string] ?? parsed.design)
+        ? LEGACY_DESIGN_IDS[parsed.design as string] ?? (parsed.design as DesignId)
+        : DEFAULT_DESIGN,
+      // A scene the user picked survives reload as a wallpaper, even if it is
+      // the default one; older saves only recorded the id.
+      sceneExplicit:
+        typeof parsed.sceneExplicit === "boolean"
+          ? parsed.sceneExplicit
+          : Boolean(parsed.scene && parsed.scene !== DEFAULT_SCENE),
+    };
+    if (!Number.isFinite(merged.remaining) || merged.remaining <= 0) {
+      merged.remaining = secondsFor(merged.mode, merged);
+    }
+    // Older saves have no study video — give everyone a working Lofi stream.
+    if (!merged.studyVideo) merged.studyVideo = DEFAULT_STUDY_VIDEO;
+    // Manual accents are stored per theme. Older saves kept a single global
+    // hue — adopt it for whichever theme was active at the time.
+    const legacyHue = (parsed as { customHue?: number | null }).customHue;
+    const hues: Partial<Record<DesignId, number>> = {};
+    for (const [key, value] of Object.entries(parsed.designHues ?? {})) {
+      // Renamed presets keep their manual accent override.
+      const id = LEGACY_DESIGN_IDS[key] ?? key;
+      if (isDesignId(id) && typeof value === "number" && Number.isFinite(value)) {
+        hues[id] = ((value % 360) + 360) % 360;
+      }
+    }
+    if (legacyHue != null && Number.isFinite(legacyHue) && hues[merged.design] == null) {
+      hues[merged.design] = ((legacyHue % 360) + 360) % 360;
+    }
+    merged.designHues = hues;
+
+    // Migrate minute-based day records to the second-based buckets, and drop
+    // anything older than ~6 months so the saved JSON never grows unbounded.
+    const stats: Record<string, DayStat> = {};
+    const cutoff = Date.now() - 1000 * 60 * 60 * 24 * 180;
+    for (const [key, value] of Object.entries(merged.stats ?? {})) {
+      const parsedDate = Date.parse(key);
+      if (Number.isFinite(parsedDate) && parsedDate < cutoff) continue;
+      const legacy = value as Partial<DayStat> & { minutes?: number; breakMinutes?: number };
+      stats[key] = {
+        focusSec: legacy.focusSec ?? Math.round((legacy.minutes ?? 0) * 60),
+        breakSec: legacy.breakSec ?? Math.round((legacy.breakMinutes ?? 0) * 60),
+        idleSec: legacy.idleSec ?? 0,
+        sessions: legacy.sessions ?? 0,
+        skippedFocus: legacy.skippedFocus ?? 0,
+      };
+    }
+    merged.stats = stats;
+    return merged;
+  } catch {
+    return defaultState();
+  }
+}
+
+function formatTime(totalSeconds: number) {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+/** Seconds → "3h 12m" / "47m" / "38s" for compact stat readouts. */
+function formatDuration(totalSeconds: number) {
+  const safe = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${safe}s`;
+}
+
+function spotifyFromUrl(url: string) {
+  const match = url.match(/open\.spotify\.com\/(track|album|playlist|artist|show|episode)\/([A-Za-z0-9]+)/);
+  return match ? { type: match[1], id: match[2] } : null;
+}
+
+function youtubeId(url: string) {
+  const match = url.match(/(?:youtu\.be\/|youtube(?:-nocookie)?\.com\/(?:watch\?v=|embed\/|shorts\/|live\/))([A-Za-z0-9_-]{11})/);
+  return match?.[1] ?? "";
+}
+
+/* Sites that send X-Frame-Options / CSP frame-ancestors and therefore cannot be
+   embedded by ANY website. Only the site owner can change that, so instead of
+   showing a blank frame we surface a proper "open in a tab" interstitial. */
+const NO_EMBED_HOSTS = [
+  "google.com", "www.google.com", "accounts.google.com", "gemini.google.com",
+  "chatgpt.com", "chat.openai.com", "openai.com", "claude.ai",
+  "youtube.com", "www.youtube.com", "music.youtube.com",
+  "x.com", "twitter.com", "instagram.com", "facebook.com", "reddit.com",
+  "www.reddit.com", "linkedin.com", "github.com", "amazon.com", "netflix.com",
+  "duckduckgo.com", "bing.com", "www.bing.com", "perplexity.ai", "notion.so",
+];
+
+function hostOf(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function isBlockedHost(url: string) {
+  const host = hostOf(url);
+  if (!host) return false;
+  return NO_EMBED_HOSTS.some((blocked) => {
+    const base = blocked.replace(/^www\./, "");
+    return host === base || host.endsWith(`.${base}`);
+  });
+}
+
+function autoScene() {
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour < 8) return "dawn" as SceneId;
+  if (hour >= 8 && hour < 13) return "forest" as SceneId;
+  if (hour >= 13 && hour < 18) return "ocean" as SceneId;
+  if (hour >= 18 && hour < 22) return "cabin" as SceneId;
+  return "pure" as SceneId;
+}
+
+/* Sample the dominant hue of the active background so the whole UI
+   is tinted by whatever is on screen — the theme is never static. */
+function sampleImageHue(url: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    const timeout = window.setTimeout(() => resolve(null), 6000);
+    img.onload = () => {
+      window.clearTimeout(timeout);
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 48;
+        canvas.height = 27;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return resolve(null);
+        ctx.drawImage(img, 0, 0, 48, 27);
+        const { data } = ctx.getImageData(0, 0, 48, 27);
+        const bins = new Array(36).fill(0);
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i] / 255;
+          const g = data[i + 1] / 255;
+          const b = data[i + 2] / 255;
+          const max = Math.max(r, g, b);
+          const min = Math.min(r, g, b);
+          const l = (max + min) / 2;
+          const d = max - min;
+          if (d < 0.06 || l < 0.1 || l > 0.9) continue;
+          let h = 0;
+          if (max === r) h = ((g - b) / d) % 6;
+          else if (max === g) h = (b - r) / d + 2;
+          else h = (r - g) / d + 4;
+          h = ((h * 60) + 360) % 360;
+          const s = d / (1 - Math.abs(2 * l - 1));
+          const bin = Math.floor(h / 10) % 36;
+          bins[bin] += s * (1 - Math.abs(l - 0.5));
+        }
+        let best = 0;
+        for (let i = 1; i < bins.length; i += 1) if (bins[i] > bins[best]) best = i;
+        resolve(bins[best] > 0 ? best * 10 + 5 : null);
+      } catch {
+        resolve(null);
+      }
+    };
+    img.onerror = () => {
+      window.clearTimeout(timeout);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+function Icon({ name }: { name: string }) {
+  const paths: Record<string, React.ReactNode> = {
+    task: <><path d="M4 7l1.5 1.5L9 5" /><path d="M4 13l1.5 1.5L9 11" /><path d="M12 7h8" /><path d="M12 13h8" /><path d="M5 19h15" /></>,
+    calendar: <><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 10h18" /></>,
+    music: <><path d="M9 18V5l11-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="17" cy="16" r="3" /></>,
+    scene: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M7 15l3-3 3 3 2-2 3 4" /><circle cx="8" cy="9" r="1.4" /></>,
+    stats: <><path d="M5 20V10" /><path d="M12 20V4" /><path d="M19 20v-7" /></>,
+    note: <><path d="M4 20h4l11-11-4-4L4 16v4z" /><path d="M13.5 6.5l4 4" /></>,
+    settings: <><circle cx="12" cy="12" r="3" /><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1" /></>,
+    attention: <><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" /><circle cx="12" cy="12" r="2.5" /><path d="M12 3V1M3.5 4.5 2 3M20.5 4.5 22 3" /></>,
+    play: <path d="M8 5.5l11 6.5-11 6.5v-13z" />,
+    pause: <><rect x="7" y="5" width="4" height="14" rx="1" /><rect x="15" y="5" width="4" height="14" rx="1" /></>,
+    reset: <><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></>,
+    skip: <><path d="M6 5l9 7-9 7V5z" /><path d="M18 5v14" /></>,
+    prev: <><path d="M18 5l-9 7 9 7V5z" /><path d="M6 5v14" /></>,
+    plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
+    trash: <><path d="M4 7h16" /><path d="M9 7V4h6v3" /><path d="M7 7l1 13h8l1-13" /></>,
+    check: <path d="M4 12l5 5L20 6" />,
+    close: <><path d="M6 6l12 12" /><path d="M18 6L6 18" /></>,
+    full: <><path d="M4 9V4h5" /><path d="M20 9V4h-5" /><path d="M4 15v5h5" /><path d="M20 15v5h-5" /></>,
+    unfull: <><path d="M9 4v5H4" /><path d="M15 4v5h5" /><path d="M9 20v-5H4" /><path d="M15 20v-5h5" /></>,
+    youtube: <><path d="M21.5 8.2a3 3 0 0 0-2.1-2.1C17.6 5.6 12 5.6 12 5.6s-5.6 0-7.4.5a3 3 0 0 0-2.1 2.1A31 31 0 0 0 2 12a31 31 0 0 0 .5 3.8 3 3 0 0 0 2.1 2.1c1.8.5 7.4.5 7.4.5s5.6 0 7.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 22 12a31 31 0 0 0-.5-3.8Z" /><path d="m10 9 5 3-5 3V9Z" /></>,
+    globe: <><circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18Z" /></>,
+    doc: <><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" /><path d="M14 3v5h5" /><path d="M9 13h6" /><path d="M9 17h4" /></>,
+    grid: <><rect x="3" y="3" width="7" height="7" rx="2" /><rect x="14" y="3" width="7" height="7" rx="2" /><rect x="3" y="14" width="7" height="7" rx="2" /><rect x="14" y="14" width="7" height="7" rx="2" /></>,
+    external: <><path d="M14 4h6v6" /><path d="M20 4 10 14" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></>,
+    back: <><path d="M15 5l-7 7 7 7" /></>,
+    next: <><path d="M9 5l7 7-7 7" /></>,
+    refresh: <><path d="M20 12a8 8 0 1 1-2.3-5.6" /><path d="M20 4v5h-5" /></>,
+    palette: <><circle cx="12" cy="12" r="9" /><circle cx="9" cy="10" r="1.1" /><circle cx="13" cy="8.5" r="1.1" /><circle cx="16" cy="11.5" r="1.1" /><circle cx="10.5" cy="14.5" r="1.1" /><path d="M12 3a9 9 0 0 0 0 18c1.1 0 1.6-.7 1.6-1.5 0-.4-.2-.7-.2-1.1 0-.7.6-1.2 1.3-1.2h1.5A3.8 3.8 0 0 0 20 13.4C20 7.7 16.4 3 12 3Z" /></>,
+  };
+  return <svg viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
+}
+
+function TaskRow({
+  task,
+  active,
+  onSelect,
+  onToggle,
+  onDelete,
+  onSchedule,
+}: {
+  task: Task;
+  active: boolean;
+  onSelect: () => void;
+  onToggle: () => void;
+  onDelete: () => void;
+  onSchedule: (date: string) => void;
+}) {
+  return (
+    <div
+      className={`task-item ${task.done ? "done" : ""} ${active ? "selected" : ""}`}
+      role="listitem"
+      onClick={onSelect}
+    >
+      <button
+        type="button"
+        onClick={(event) => { event.stopPropagation(); onToggle(); }}
+        aria-label="Toggle done"
+        aria-pressed={task.done}
+      >
+        <Icon name="check" />
+      </button>
+      <div className="task-item-main">
+        <span className="task-item-title">{task.text}</span>
+        <div className="task-item-meta">
+          <label
+            className={`task-date-control ${task.scheduledFor ? "is-planned" : ""}`}
+            onClick={(event) => event.stopPropagation()}
+            title={task.scheduledFor ? `Planned for ${formatLongDate(task.scheduledFor)}` : "Add this task to the planner"}
+          >
+            <Icon name="calendar" />
+            <span>{task.scheduledFor ? formatTaskDate(task.scheduledFor) : "Plan"}</span>
+            <input
+              type="date"
+              value={task.scheduledFor ?? ""}
+              onChange={(event) => onSchedule(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              aria-label={task.scheduledFor ? `Change planned date for ${task.text}` : `Plan ${task.text} on a date`}
+            />
+          </label>
+          {task.scheduledFor && (
+            <button
+              type="button"
+              className="task-date-clear"
+              onClick={(event) => { event.stopPropagation(); onSchedule(""); }}
+              aria-label="Remove planned date"
+              title="Remove planned date"
+            >
+              <Icon name="close" />
+            </button>
+          )}
+          {task.pomosDone > 0 && (
+            <small className="task-pomo-count" title={`${task.pomosDone} focus sessions completed`}>
+              {task.pomosDone} 🍅
+            </small>
+          )}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="delete"
+        onClick={(event) => { event.stopPropagation(); onDelete(); }}
+        aria-label="Delete task"
+      >
+        <Icon name="trash" />
+      </button>
+    </div>
+  );
+}
+
+/** #rrggbb → hue (0-359). Used by the custom accent color picker. */
+function hexToHue(hex: string): number {
+  const clean = hex.replace("#", "");
+  const r = parseInt(clean.substring(0, 2), 16) / 255;
+  const g = parseInt(clean.substring(2, 4), 16) / 255;
+  const b = parseInt(clean.substring(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+  }
+  return Math.round(((h * 60 + 360) % 360));
+}
+
+/** hue → #rrggbb at the same saturation/lightness used for scene accents,
+    so the swatches and the native color input always match what's rendered. */
+function hslToHex(h: number, s: number, l: number): string {
+  const sat = s / 100;
+  const light = l / 100;
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = sat * Math.min(light, 1 - light);
+  const f = (n: number) => light - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = (x: number) => Math.round(255 * x).toString(16).padStart(2, "0");
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`;
+}
+
+/** Batches rapid updates (pointer drags) to once per animation frame, so a
+    fast mouse move doesn't force a React re-render on every pixel — the
+    drag still tracks the cursor exactly, just paced to the display's own
+    refresh cadence instead of the input event rate. */
+function useRafBatched<T>(callback: (value: T) => void) {
+  const box = useRef<{ raf: number | null; value: T | null }>({ raf: null, value: null });
+  useEffect(
+    () => () => {
+      if (box.current.raf != null) cancelAnimationFrame(box.current.raf);
+    },
+    [],
+  );
+  return (value: T) => {
+    box.current.value = value;
+    if (box.current.raf == null) {
+      box.current.raf = requestAnimationFrame(() => {
+        box.current.raf = null;
+        if (box.current.value != null) callback(box.current.value);
+      });
+    }
+  };
+}
+
+function FloatingWindow({
+  title,
+  icon,
+  win,
+  z = 12,
+  onFocus,
+  onPatch,
+  onClose,
+  children,
+}: {
+  title: string;
+  icon: string;
+  win: WinFrame;
+  z?: number;
+  onFocus?: () => void;
+  onPatch: (patch: Partial<WinFrame>) => void;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const drag = useRef<{ mode: "move" | "resize"; sx: number; sy: number; ox: number; oy: number; ow: number; oh: number } | null>(null);
+  const batchedPatch = useRafBatched<Partial<WinFrame>>(onPatch);
+
+  const begin = (mode: "move" | "resize") => (e: React.PointerEvent) => {
+    if (win.full) return;
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    drag.current = { mode, sx: e.clientX, sy: e.clientY, ox: win.x, oy: win.y, ow: win.w, oh: win.h };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+
+  const move = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = e.clientX - d.sx;
+    const dy = e.clientY - d.sy;
+    if (d.mode === "move") {
+      batchedPatch({
+        x: clamp(d.ox + dx, 70 - d.ow, window.innerWidth - 70),
+        y: clamp(d.oy + dy, 2, window.innerHeight - 54),
+      });
+    } else {
+      batchedPatch({
+        w: clamp(d.ow + dx, 300, window.innerWidth - 8),
+        h: clamp(d.oh + dy, 340, window.innerHeight - 8),
+      });
+    }
+  };
+
+  const end = () => {
+    drag.current = null;
+  };
+
+  const style = win.full
+    ? { left: 0, top: 0, width: "100vw", height: "100dvh", zIndex: z }
+    : {
+        left: Math.min(win.x, window.innerWidth - 40),
+        top: Math.min(win.y, window.innerHeight - 60),
+        width: Math.min(win.w, window.innerWidth - 12),
+        height: Math.min(win.h, window.innerHeight - 12),
+        zIndex: z,
+      };
+
+  return (
+    <div className={`float-win ${win.full ? "is-full" : ""}`} style={style} onPointerDownCapture={onFocus}>
+      <div className="fw-head" onPointerDown={begin("move")} onPointerMove={move} onPointerUp={end} onPointerCancel={end}>
+        <div className="fw-title"><Icon name={icon} /><span>{title}</span></div>
+        <div className="fw-actions" onPointerDown={(e) => e.stopPropagation()}>
+          <button className="icon-button" onClick={() => onPatch({ full: !win.full })} aria-label={`Toggle ${title} fullscreen`} title="Fullscreen">
+            <Icon name={win.full ? "unfull" : "full"} />
+          </button>
+          <button className="icon-button" onClick={onClose} aria-label={`Close ${title}`} title="Close">
+            <Icon name="close" />
+          </button>
+        </div>
+      </div>
+      <div className="fw-body">{children}</div>
+      {!win.full && (
+        <div className="fw-resize" title="Drag to resize" onPointerDown={begin("resize")} onPointerMove={move} onPointerUp={end} onPointerCancel={end} />
+      )}
+    </div>
+  );
+}
+
+/** Renders 25 : 00 with breathing room around the colon. */
+function TimeReadout({ seconds }: { seconds: number }) {
+  const parts = formatTime(seconds).split(":");
+  return (
+    <div className="time-readout">
+      {parts.map((part, index) => (
+        <span key={index}>
+          {index > 0 && <i className="tr-colon">:</i>}
+          <b>{part}</b>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function NumberField({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
+  return (
+    <label className="field compact"><span>{label}</span><input type="number" min={min} max={max} value={value} onChange={(event) => onChange(clamp(Number(event.target.value) || min, min, max))} /></label>
+  );
+}
+
+/* The "Remove tint" switch. It is a colour control (it lives under the accent
+   ramp) but it only means anything once a wallpaper is set, so the Scenes tab
+   gets the same switch rather than sending people to the other tab. */
+function TintButton({ tinted, wallpaper, onToggle }: { tinted: boolean; wallpaper: boolean; onToggle: () => void }) {
+  return (
+    <button
+      className={`theme-reset tint-toggle ${tinted ? "" : "is-off"}`}
+      onClick={onToggle}
+      aria-pressed={!tinted}
+      title={
+        tinted
+          ? "Take the theme's colour wash off your wallpaper — the picture stays exactly as it is."
+          : "Put the theme's colour wash back on the wallpaper."
+      }
+    >
+      {tinted ? "Remove tint" : "Tint is off — restore"}
+      <small>
+        {wallpaper
+          ? tinted
+            ? "wallpaper is colour-washed toward this theme"
+            : "wallpaper shown untouched"
+          : "only applies when a wallpaper is set"}
+      </small>
+    </button>
+  );
+}
+
+function ToggleRow({ label, value, onChange }: { label: string; value: boolean; onChange: (value: boolean) => void }) {
+  return <div className="switch-row"><span>{label}</span><button className={value ? "switch on" : "switch"} onClick={() => onChange(!value)} /></div>;
+}
+
+function App() {
+  const [state, setState] = useState<AppState>(loadState);
+  const { store: attentionStore, updateStore: updateAttentionStore } = useAttentionStore();
+  const [attentionController] = useState(() => new AttentionGuardController());
+  const consumeLegacyNotes = useCallback(() => {
+    setState((prev) => prev.notes ? { ...prev, notes: "" } : prev);
+  }, []);
+  const [running, setRunning] = useState(false);
+  const [openPanels, setOpenPanels] = useState<PanelId[]>([]);
+  const [clock, setClock] = useState(new Date());
+  const [quoteIndex, setQuoteIndex] = useState(() => Math.floor(Math.random() * quotes.length));
+  const [taskInput, setTaskInput] = useState("");
+  const [taskView, setTaskView] = useState<"tasks" | "planner">("tasks");
+  const [plannerDate, setPlannerDate] = useState(() => todayKey());
+  const [spotifyInput, setSpotifyInput] = useState("");
+  const [imageInput, setImageInput] = useState("");
+  const [youtubeInput, setYoutubeInput] = useState("");
+  const [studyInput, setStudyInput] = useState(state.studyVideo);
+  const [musicTab, setMusicTab] = useState<"spotify" | "youtube">("spotify");
+  /** Personalization keeps scenes, themes, and layout together in one tabbed panel. */
+  const [personalTab, setPersonalTab] = useState<PersonalTab>("themes");
+  const [arrangementEditing, setArrangementEditing] = useState(false);
+  const [arrangementName, setArrangementName] = useState("");
+  const [draftPositions, setDraftPositions] = useState<LayoutPositions | null>(null);
+  const [draggingItem, setDraggingItem] = useState<StageItemId | null>(null);
+  const [ytMusicInput, setYtMusicInput] = useState("");
+  const [phaseLine, setPhaseLine] = useState(() => pickRandom(FOCUS_LINES));
+  const [toast, setToast] = useState("");
+  const toastTimeout = useRef<number | null>(null);
+  const [sampledHue, setSampledHue] = useState<number | null>(null);
+  const [utilTab, setUtilTab] = useState<UtilId | null>(null);
+  const [utilMenu, setUtilMenu] = useState(false);
+  const [utilWidth, setUtilWidth] = useState(() => Math.min(760, Math.max(380, window.innerWidth * 0.46)));
+  const [utilHeight, setUtilHeight] = useState<number | null>(null);
+  const [browserUrl, setBrowserUrl] = useState("https://en.wikipedia.org/wiki/Pomodoro_Technique");
+  const [browserInput, setBrowserInput] = useState("");
+  const [browserNonce, setBrowserNonce] = useState(0);
+  const [liveFrame, setLiveFrame] = useState(false);
+  const [history, setHistory] = useState<string[]>([]);
+  const [files, setFiles] = useState<LocalFile[]>([]);
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [fileZoom, setFileZoom] = useState(1);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [confetti, setConfetti] = useState<Array<{ id: string; x: number; dx: number; delay: number; dur: number; size: number; rot: number }>>([]);
+  const endAt = useRef(0);
+  const segmentStartedAt = useRef<number | null>(null);
+  const segmentElapsed = useRef(0);
+  const completionLock = useRef(false);
+  const completionTimeout = useRef<number | null>(null);
+  const timerRunId = useRef(0);
+  const pendingAutoStart = useRef(false);
+  const totalSessionsCache = useRef<{ sessionsDone: number; value: number } | null>(null);
+  const streakCache = useRef<{ dayKey: string; sessionsDone: number; value: number } | null>(null);
+  const lastCheckIn = useRef(Date.now());
+  const utilDrag = useRef<{ axis: "x" | "y" | "xy"; sx: number; sy: number; ow: number; oh: number } | null>(null);
+  const stageRef = useRef<HTMLElement | null>(null);
+  const arrangementDrag = useRef<{
+    item: StageItemId;
+    startX: number;
+    startY: number;
+    startPosition: LayoutPoint;
+    stageWidth: number;
+    stageHeight: number;
+  } | null>(null);
+  const batchedUtilResize = useRafBatched<{ w?: number; h?: number }>((patch) => {
+    if (patch.w !== undefined) setUtilWidth(patch.w);
+    if (patch.h !== undefined) setUtilHeight(patch.h);
+  });
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const runningRef = useRef(running);
+  runningRef.current = running;
+  const attentionStoreRef = useRef(attentionStore);
+  attentionStoreRef.current = attentionStore;
+  const focusTimerActive = isActiveFocusTimer(running, state.mode);
+
+  useEffect(() => {
+    attentionController.mount();
+    return () => attentionController.dispose();
+  }, [attentionController]);
+  useEffect(() => () => {
+    if (toastTimeout.current != null) window.clearTimeout(toastTimeout.current);
+    if (completionTimeout.current != null) window.clearTimeout(completionTimeout.current);
+  }, []);
+  useEffect(() => {
+    attentionController.setFocusTimerActive(focusTimerActive);
+  }, [attentionController, focusTimerActive]);
+  useEffect(() => attentionController.subscribeInterventions((intervention) => {
+    const liveState = stateRef.current;
+    if (!runningRef.current || liveState.mode !== "focus") return;
+
+    const preferences = attentionStoreRef.current;
+    const shouldPause = preferences.offTargetAlertsEnabled
+      && shouldPauseFocusTimer(intervention.level, preferences.strictPause, isActiveFocusTimer(runningRef.current, liveState.mode));
+    if (intervention.reason !== "screen-break" && !preferences.offTargetAlertsEnabled && !shouldPause) return;
+    if (preferences.soundEnabled) playAttentionWarning(intervention.level);
+    if (shouldPause) {
+      const cause = intervention.reason === "face-not-detected" ? "your face was not visible" : "you were away from your work area";
+      notify(`Focus timer paused because ${cause} for a while. Resume when you're ready.`);
+      pauseTimer();
+      return;
+    }
+
+    if (intervention.reason === "screen-break") {
+      const intervalMinutes = preferences.screenBreakReminderMinutes;
+      notify(`Screen break reminder: you have spent ${intervalMinutes} minutes continuously inside your calibrated Screen zone. Take a short break if it feels helpful.`);
+      return;
+    }
+    const message = intervention.reason === "face-not-detected"
+      ? "Attention Guard can't see your face. Check the camera position or sit back in frame."
+      : intervention.level === 1
+        ? "Gentle reminder: take a moment to look back at your calibrated work area."
+        : "You've been away from your work area for a while. Recenter when you're ready.";
+    notify(message);
+  }), [attentionController]);
+  useEffect(() => {
+    attentionController.setProfile(activeAttentionProfile(attentionStore));
+  }, [attentionController, attentionStore]);
+  useEffect(() => {
+    attentionController.setScreenBreakReminderMinutes(attentionStore.screenBreakReminderMinutes);
+  }, [attentionController, attentionStore.screenBreakReminderMinutes]);
+  useEffect(() => {
+    if (attentionController.getState().status === "off") attentionController.selectDevice(attentionStore.cameraDeviceId);
+  }, [attentionController, attentionStore.cameraDeviceId]);
+
+  const totalSeconds = secondsFor(state.mode, state);
+  const progress = clamp(1 - state.remaining / Math.max(totalSeconds, 1), 0, 1);
+  const activeTask = state.tasks.find((task) => task.id === state.activeTaskId) ?? null;
+  const selectedCustomArrangement = state.customArrangements.find((item) => item.id === state.arrangement) ?? null;
+  const stageArrangement = arrangementEditing || selectedCustomArrangement ? "custom" : state.arrangement;
+  const stagePositions = arrangementEditing
+    ? draftPositions ?? DEFAULT_LAYOUT_POSITIONS
+    : selectedCustomArrangement?.positions ?? null;
+  const isBreak = state.mode === "short" || state.mode === "long";
+  const studyId = state.studyVideo ? youtubeId(state.studyVideo) : "";
+  const activeFile = files.find((file) => file.id === activeFileId) ?? null;
+
+  /* Pomodoro cycle position: how many focus sessions are done in the current cycle */
+  const cycleLength = state.settings.sessionsBeforeLong;
+  const inCycle = state.sessionsDone % cycleLength;
+
+  /* ---- dynamic theme: hue is sampled from whatever is on screen ---- */
+  const preset = designById(state.design);
+  const customHue = state.designHues[state.design] ?? null;
+  const effectiveScene = state.sceneAuto ? autoScene() : state.scene;
+  const bgUrl = state.customImage || (effectiveScene !== "pure" ? SCENE_IMAGES[effectiveScene] : "");
+  /* A wallpaper is whatever the user put there on purpose — a custom image, a
+     YouTube background or a scene they picked. It shows behind every theme; the
+     theme only decides how it is tinted and how legible the type stays. */
+  const ytId = state.customYoutube ? youtubeId(state.customYoutube) || state.customYoutube : "";
+  const scenePicked = state.sceneAuto || state.sceneExplicit;
+  const wallpaper: "image" | "video" | "scene" | "" = state.customImage
+    ? "image"
+    : ytId
+      ? "video"
+      : scenePicked && effectiveScene !== "pure"
+        ? "scene"
+        : "";
+  const wallpaperImage = wallpaper === "image" ? state.customImage : wallpaper === "scene" ? SCENE_IMAGES[effectiveScene] : "";
+
+  useEffect(() => {
+    let alive = true;
+    setSampledHue(null);
+    // A manual color override always wins, so skip the network fetch and
+    // canvas decode entirely while one is active — nothing to gain from it.
+    // Presets that ship their own accent (terminal, brutalist, aurora) don't
+    // follow the background either, so they skip it too.
+    if (!bgUrl || customHue != null || preset.accent != null) return;
+    sampleImageHue(bgUrl).then((hue) => {
+      if (alive) setSampledHue(hue);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [bgUrl, customHue, preset.accent]);
+
+  // Priority: your manual pick > the theme's own palette > the hue sampled off
+  // the current background > the scene's default. Never static, intentional.
+  const accentSat = preset.accent?.sat ?? 66;
+  const accentLight = preset.accent?.light ?? 60;
+  // The hue (and therefore the brightness) the preset was designed around.
+  const designedHue = preset.accent?.hue ?? SCENE_HUES[effectiveScene];
+  const hue = customHue ?? preset.accent?.hue ?? sampledHue ?? SCENE_HUES[effectiveScene];
+  // A hand-picked hue replaces the hue and nothing else: saturation stays put
+  // and the colour is re-lit to the preset's own brightness, so every surface
+  // that leans on the accent keeps the contrast its text was designed against
+  // whichever hue you land on.
+  const accentLightFit =
+    Math.abs(hue - designedHue) < 0.5
+      ? accentLight
+      : lightnessFor(luminance({ h: designedHue, s: accentSat, l: accentLight }), hue, accentSat, accentLight);
+  // The break phase is designed as an offset from the accent, so it travels with
+  // your pick instead of staying on the old hue.
+  const breakOffset =
+    preset.breakHue == null ? 140 : (((preset.breakHue - designedHue) % 360) + 360) % 360;
+  const breakHue = customHue != null ? (customHue + breakOffset) % 360 : preset.breakHue ?? (hue + 140) % 360;
+  const breakLight = lightnessFor(
+    luminance({ h: preset.breakHue ?? (designedHue + 140) % 360, s: 62, l: 64 }),
+    breakHue,
+    62,
+    64,
+  );
+  const themeVars = useMemo(
+    () =>
+      ({
+        "--accent": `hsl(${hue} ${accentSat}% ${accentLightFit}%)`,
+        "--accent-2": `hsl(${hue} ${clamp(accentSat + 6, 0, 100)}% ${clamp(accentLightFit - 14, 0, 100)}%)`,
+        "--accent-glow": `hsla(${hue}, ${clamp(accentSat + 9, 0, 100)}%, ${accentLightFit}%, 0.45)`,
+        "--accent-soft": `hsla(${hue}, ${clamp(accentSat + 4, 0, 100)}%, ${accentLightFit}%, 0.15)`,
+        "--accent-ink": inkOn({ h: hue, s: accentSat, l: accentLightFit }),
+        "--break": `hsl(${breakHue} 62% ${breakLight}%)`,
+      }) as React.CSSProperties,
+    [hue, accentSat, accentLightFit, breakHue, breakLight],
+  );
+
+  /* ---- persistence ----
+     Debounced so a state field that changes every second (the running
+     timer, live stat accrual) doesn't serialize and write the whole
+     document to localStorage many times a second. A flush on tab-hide /
+     unload guarantees the last few hundred milliseconds are never lost. */
+  useEffect(() => {
+    const id = window.setTimeout(() => localStorage.setItem(STORE_KEY, JSON.stringify(state)), 600);
+    return () => window.clearTimeout(id);
+  }, [state]);
+
+  /* ---- interface sounds
+     One delegated listener rather than a handler on every button: any press on
+     something interactive plays the current theme's voice, and pressing a theme
+     card previews that theme's voice instead. Off by default only if the
+     browser has no Web Audio at all — otherwise it follows the setting. */
+  useEffect(() => {
+    if (!state.settings.uiSound) return;
+    const interactive = (node: EventTarget | null) =>
+      node instanceof Element
+        ? node.closest<HTMLElement>(
+            "button, [role='button'], .design-card, .scene-pick, .theme-link, input[type='range']",
+          )
+        : null;
+    const onPointerDown = (event: PointerEvent) => {
+      const el = interactive(event.target);
+      if (!el || (el as HTMLButtonElement).disabled) return;
+      const card = el.closest<HTMLElement>(".design-card");
+      const preview = card?.dataset.preview;
+      playUi(preview ?? state.design, preview ? "select" : "tap");
+    };
+    // Keyboard and assistive activation fire a click with detail === 0.
+    const onClick = (event: MouseEvent) => {
+      if (event.detail !== 0) return;
+      const el = interactive(event.target);
+      if (!el || (el as HTMLButtonElement).disabled) return;
+      playUi(state.design, "tap");
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("click", onClick, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("click", onClick, true);
+    };
+  }, [state.settings.uiSound, state.design]);
+
+  useEffect(() => {
+    const flush = () => {
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify(stateRef.current));
+      } catch {
+        /* storage full or unavailable — nothing more we can do here */
+      }
+    };
+    const onHide = () => {
+      if (document.hidden) flush();
+    };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onHide);
+    };
+  }, []);
+
+  /* ---- clock + quote rotation ---- */
+  useEffect(() => {
+    const id = window.setInterval(() => setClock(new Date()), 15000);
+    // Pick a fresh random quote each rotation (never immediately repeating)
+    // so a much larger library feels varied instead of walking in order.
+    const quoteId = window.setInterval(() => {
+      setQuoteIndex((idx) => {
+        if (quotes.length <= 1) return idx;
+        let next = idx;
+        while (next === idx) next = Math.floor(Math.random() * quotes.length);
+        return next;
+      });
+    }, 45000);
+    return () => {
+      window.clearInterval(id);
+      window.clearInterval(quoteId);
+    };
+  }, []);
+
+  /* ---- timer engine: timestamp-based so it never drifts ----
+     Ticks once a second — the readout only ever shows whole seconds anyway,
+     so there is nothing to gain from updating four times as often, only a
+     4x reduction in re-renders and localStorage churn while running. */
+  useEffect(() => {
+    if (!running) return;
+    completionLock.current = false;
+    const runId = timerRunId.current;
+    const interval = window.setInterval(() => {
+      if (runId !== timerRunId.current || !runningRef.current) return;
+      const next = secondsRemaining(endAt.current, Date.now());
+      setState((prev) => (prev.remaining === next ? prev : { ...prev, remaining: next }));
+      // Read live settings from the ref — the effect closure would go stale
+      // if the user toggles check-ins mid-session.
+      const live = stateRef.current;
+      if (live.settings.checkIns && live.mode === "focus" && Date.now() - lastCheckIn.current > live.settings.checkInMinutes * 60000) {
+        lastCheckIn.current = Date.now();
+        notify("Quick check-in: still on the chosen task?");
+      }
+      if (next <= 0 && !completionLock.current) {
+        completionLock.current = true;
+        attentionController.setFocusTimerActive(false);
+        const completionRunId = runId;
+        const timeoutId = window.setTimeout(() => {
+          if (completionTimeout.current === timeoutId) completionTimeout.current = null;
+          if (completionRunId !== timerRunId.current) return;
+          completeSegment();
+        }, 0);
+        completionTimeout.current = timeoutId;
+      }
+    }, 1000);
+    return () => window.clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, state.mode]);
+
+  useEffect(() => {
+    document.title = running ? `${formatTime(state.remaining)} | ${modeLabels[state.mode]}` : "Focus | Quiet work timer";
+  }, [running, state.remaining, state.mode]);
+
+  /* Auto-start the next segment when its state is ready */
+  useEffect(() => {
+    if (!pendingAutoStart.current || running) return;
+    pendingAutoStart.current = false;
+    startTimer();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.mode, state.remaining, running]);
+
+  /* Keyboard shortcuts: Space start/pause · R reset · Esc close window.
+     The handler is kept in a ref so it always sees the latest state. */
+  const keyHandler = useRef<(e: KeyboardEvent) => void>(() => {});
+  keyHandler.current = (e: KeyboardEvent) => {
+    if (arrangementEditing) {
+      if (e.key === "Escape") cancelArrangementEdit();
+      return;
+    }
+    const el = e.target as HTMLElement | null;
+    if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+    if (el?.closest("button, a[href], select, summary, [role='button'], [role='switch'], [role='tab'], [role='menuitem']") && e.key !== "Escape") return;
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (running) pauseTimer();
+      else startTimer();
+    } else if (e.key === "r" || e.key === "R") {
+      resetTimer();
+    } else if (e.key === "Escape") {
+      setUtilMenu(false);
+      setOpenPanels((prev) => prev.slice(0, -1));
+    }
+  };
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => keyHandler.current(e);
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  useEffect(() => {
+    setFileZoom(1);
+  }, [activeFileId]);
+
+  // A fresh tagline every time the phase changes — never the task text,
+  // never repeating the chip shown below the controls.
+  useEffect(() => {
+    setPhaseLine(pickRandom(phaseLinesFor(state.mode)));
+  }, [state.mode]);
+
+  /* ---- live time accrual ----
+     Every second the elapsed wall time is added to whichever bucket is
+     currently active, so a focus session that is paused or skipped after
+     five minutes still records those five minutes. The delta is capped so
+     a sleeping laptop or a backgrounded tab cannot inject phantom hours. */
+  const accrualRef = useRef(Date.now());
+  useEffect(() => {
+    const flush = () => {
+      const now = Date.now();
+      const delta = Math.min((now - accrualRef.current) / 1000, 90);
+      accrualRef.current = now;
+      if (delta < 0.5) return;
+
+      const live = stateRef.current;
+      const bucket: keyof Pick<DayStat, "focusSec" | "breakSec" | "idleSec"> = !runningRef.current
+        ? "idleSec"
+        : live.mode === "focus"
+          ? "focusSec"
+          : "breakSec";
+
+      setState((prev) => {
+        const key = todayKey();
+        const day = prev.stats[key] ?? emptyDay();
+        return { ...prev, stats: { ...prev.stats, [key]: { ...day, [bucket]: day[bucket] + delta } } };
+      });
+    };
+
+    const id = window.setInterval(flush, 1000);
+    // Don't bank time that passed while the tab was hidden or the device slept.
+    const onVisible = () => {
+      if (document.hidden) flush();
+      accrualRef.current = Date.now();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncFullscreen = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    syncFullscreen();
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
+
+  function resetSegmentClock() {
+    segmentStartedAt.current = null;
+    segmentElapsed.current = 0;
+  }
+
+  function cancelPendingCompletion() {
+    if (completionTimeout.current != null) {
+      window.clearTimeout(completionTimeout.current);
+      completionTimeout.current = null;
+    }
+    completionLock.current = false;
+  }
+
+  function burstConfetti() {
+    const pieces = Array.from({ length: 56 }, () => ({
+      id: uid(),
+      x: 12 + Math.random() * 76,
+      dx: -180 + Math.random() * 360,
+      delay: Math.random() * 0.18,
+      dur: 1.8 + Math.random() * 1.2,
+      size: 6 + Math.random() * 8,
+      rot: Math.random() * 720,
+    }));
+    setConfetti(pieces);
+    window.setTimeout(() => setConfetti([]), 3400);
+  }
+
+  async function toggleAppFullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      notify("Fullscreen is blocked by this browser or preview frame.");
+    }
+  }
+
+  function openPanel(id: PanelId) {
+    setOpenPanels((prev) => (prev.includes(id) ? [...prev.filter((p) => p !== id), id] : [...prev, id]));
+  }
+
+  function closePanel(id: PanelId) {
+    setOpenPanels((prev) => prev.filter((p) => p !== id));
+  }
+
+  function togglePanel(id: PanelId) {
+    setOpenPanels((prev) => (prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id]));
+  }
+
+  /** Focus a window by pushing it to the end of the stacking order. */
+  function raisePanel(id: PanelId) {
+    setOpenPanels((prev) => (prev[prev.length - 1] === id ? prev : [...prev.filter((p) => p !== id), id]));
+  }
+
+  function openUtility(id: UtilId) {
+    setUtilTab((prev) => (prev === id ? null : id));
+    setUtilMenu(false);
+  }
+
+  /** Treat input as a URL when it looks like one, otherwise search the web. */
+  function goToBrowserTarget(raw: string) {
+    const value = raw.trim();
+    if (!value) return;
+    const looksLikeUrl = /^https?:\/\//i.test(value) || /^[\w-]+(\.[\w-]+)+(\/|$|\?)/.test(value);
+    const target = looksLikeUrl
+      ? value.startsWith("http")
+        ? value
+        : `https://${value}`
+      // DuckDuckGo's plain-HTML endpoint extracts cleanly into reader mode.
+      : `https://duckduckgo.com/html/?q=${encodeURIComponent(value)}`;
+    navigateTo(target);
+  }
+
+  function navigateTo(target: string) {
+    setHistory((prev) => (browserUrl ? [...prev, browserUrl].slice(-40) : prev));
+    setBrowserUrl(target);
+    setBrowserNonce((n) => n + 1);
+  }
+
+  function goBack() {
+    setHistory((prev) => {
+      if (!prev.length) return prev;
+      const next = prev.slice(0, -1);
+      setBrowserUrl(prev[prev.length - 1]);
+      setBrowserNonce((n) => n + 1);
+      return next;
+    });
+  }
+
+  /* Decide how to render a file from both its MIME type and its extension —
+     many local files arrive with an empty type string. */
+  function classifyFile(file: File): FileKind {
+    const name = file.name.toLowerCase();
+    const type = file.type;
+    if (type.startsWith("image/") || /\.(png|jpe?g|gif|webp|avif|bmp|svg|ico)$/.test(name)) return "image";
+    if (type.startsWith("video/") || /\.(mp4|webm|ogv|mov|mkv)$/.test(name)) return "video";
+    if (type.startsWith("audio/") || /\.(mp3|wav|ogg|m4a|flac|aac)$/.test(name)) return "audio";
+    if (type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+    if (
+      type.startsWith("text/") ||
+      /\.(txt|md|markdown|csv|tsv|json|jsonc|log|xml|yml|yaml|ini|env|js|jsx|ts|tsx|css|scss|html?|py|rb|go|rs|java|c|h|cpp|cs|php|sh|sql)$/.test(name)
+    ) {
+      return "text";
+    }
+    return "other";
+  }
+
+  async function addLocalFiles(list: FileList | null) {
+    if (!list?.length) return;
+    const added: LocalFile[] = [];
+    for (const file of Array.from(list)) {
+      const kind = classifyFile(file);
+      const entry: LocalFile = { id: uid(), name: file.name, type: file.type, url: URL.createObjectURL(file), kind };
+      if (kind === "text") {
+        try {
+          entry.text = await file.text();
+        } catch {
+          entry.kind = "other";
+        }
+      } else if (kind === "pdf") {
+        // Read the bytes up front — PDFs are painted to canvas, never framed.
+        try {
+          entry.data = await file.arrayBuffer();
+        } catch {
+          entry.kind = "other";
+        }
+      }
+      added.push(entry);
+    }
+    setFiles((prev) => [...prev, ...added]);
+    setActiveFileId(added[added.length - 1]?.id ?? null);
+  }
+
+  function removeLocalFile(id: string) {
+    setFiles((prev) => {
+      const target = prev.find((file) => file.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      return prev.filter((file) => file.id !== id);
+    });
+    setActiveFileId((current) => (current === id ? null : current));
+  }
+
+  function loadStudyVideo() {
+    const url = studyInput.trim();
+    const id = youtubeId(url);
+    if (!id) {
+      notify("Couldn't read a video ID from that YouTube link.");
+      return;
+    }
+    setState((prev) => ({ ...prev, studyVideo: url }));
+    setStudyInput(url);
+  }
+
+  function notify(message: string) {
+    if (toastTimeout.current != null) window.clearTimeout(toastTimeout.current);
+    setToast(message);
+    toastTimeout.current = window.setTimeout(() => {
+      toastTimeout.current = null;
+      setToast("");
+    }, 2400);
+  }
+
+  function chooseDesign(id: DesignId) {
+    setState((prev) => ({ ...prev, design: id }));
+    notify(id === DEFAULT_DESIGN ? "Original look restored." : `${designById(id).name} theme applied.`);
+  }
+
+  /* Accent overrides are remembered per theme, so a colour you picked for one
+     look is still there when you come back to it. Null forgets the override. */
+  function setAccentHue(value: number | null) {
+    setState((prev) => {
+      const next = { ...prev.designHues };
+      if (value == null) delete next[prev.design];
+      else next[prev.design] = ((Math.round(value) % 360) + 360) % 360;
+      return { ...prev, designHues: next };
+    });
+  }
+
+  function setTimerRunning(nextRunning: boolean, mode = stateRef.current.mode) {
+    if (runningRef.current !== nextRunning) timerRunId.current += 1;
+    runningRef.current = nextRunning;
+    attentionController.setFocusTimerActive(isActiveFocusTimer(nextRunning, mode));
+    setRunning(nextRunning);
+  }
+
+  function startTimer() {
+    pendingAutoStart.current = false;
+    if (runningRef.current) return;
+    endAt.current = Date.now() + Math.max(1, state.remaining) * 1000;
+    segmentStartedAt.current = Date.now();
+    lastCheckIn.current = Date.now();
+    setTimerRunning(true, state.mode);
+  }
+
+  function pauseTimer() {
+    pendingAutoStart.current = false;
+    const wasRunning = runningRef.current;
+    const remaining = secondsRemaining(endAt.current, Date.now());
+    if (wasRunning && remaining === 0) {
+      cancelPendingCompletion();
+      completeSegment();
+      return;
+    }
+    cancelPendingCompletion();
+    if (wasRunning) {
+      setState((prev) => (prev.remaining === remaining ? prev : { ...prev, remaining }));
+    }
+    if (segmentStartedAt.current) {
+      segmentElapsed.current += Math.floor((Date.now() - segmentStartedAt.current) / 1000);
+      segmentStartedAt.current = null;
+    }
+    setTimerRunning(false);
+  }
+
+  function resetTimer() {
+    pendingAutoStart.current = false;
+    cancelPendingCompletion();
+    setTimerRunning(false);
+    resetSegmentClock();
+    setState((prev) => ({ ...prev, remaining: secondsFor(prev.mode, prev) }));
+  }
+
+  function switchMode(mode: ModeId) {
+    if (mode === stateRef.current.mode) return;
+    pendingAutoStart.current = false;
+    cancelPendingCompletion();
+    setTimerRunning(false, mode);
+    resetSegmentClock();
+    setState((prev) => ({ ...prev, mode, remaining: secondsFor(mode, prev) }));
+  }
+
+  function startFocusTimerFromAttention() {
+    if (state.mode === "focus") {
+      startTimer();
+      return;
+    }
+    switchMode("focus");
+    pendingAutoStart.current = true;
+  }
+
+  /* Classic pomodoro cycle: after N focus sessions the long break is next,
+     otherwise a short break. Any break is followed by focus. */
+  function modeAfterFocus(sessionsDone: number, n: number): ModeId {
+    return sessionsDone % n === 0 ? "long" : "short";
+  }
+
+  function completeSegment() {
+    setTimerRunning(false);
+    // Read the latest timer settings and session count rather than the timer
+    // effect's render-time closure; settings can change mid-session.
+    const prev = stateRef.current;
+    const wasFocus = prev.mode === "focus";
+    const n = prev.settings.sessionsBeforeLong;
+    const sessionsDone = wasFocus ? prev.sessionsDone + 1 : prev.sessionsDone;
+    const nextMode: ModeId = wasFocus ? modeAfterFocus(sessionsDone, n) : "focus";
+    const shouldAutoStart =
+      (nextMode === "focus" && prev.settings.autoStartFocus) ||
+      ((nextMode === "short" || nextMode === "long") && prev.settings.autoStartBreaks);
+    setState((last) => {
+      const nextStats = { ...last.stats };
+      const nextTasks = last.tasks.map((task) => ({ ...task }));
+      if (wasFocus) {
+        // Minutes are already banked by the live accrual ticker; only the
+        // completed-session count is recorded here.
+        const key = todayKey();
+        const day = nextStats[key] ?? emptyDay();
+        nextStats[key] = { ...day, sessions: day.sessions + 1 };
+        const active = nextTasks.find((task) => task.id === last.activeTaskId);
+        if (active) active.pomosDone += 1;
+      }
+      return { ...last, tasks: nextTasks, stats: nextStats, sessionsDone, mode: nextMode, remaining: secondsFor(nextMode, last) };
+    });
+    if (wasFocus) burstConfetti();
+    resetSegmentClock();
+    pendingAutoStart.current = shouldAutoStart;
+  }
+
+  function skipSegment() {
+    pendingAutoStart.current = false;
+    cancelPendingCompletion();
+    setTimerRunning(false);
+    const prev = state;
+    const wasFocus = prev.mode === "focus";
+    const n = prev.settings.sessionsBeforeLong;
+    const sessionsDone = wasFocus ? prev.sessionsDone + 1 : prev.sessionsDone;
+    // Skipping advances the cycle. Whatever minutes were actually worked are
+    // already banked by the live ticker — only the skip count is added here.
+    const nextMode: ModeId = wasFocus ? modeAfterFocus(sessionsDone, n) : "focus";
+    setState((last) => {
+      const key = todayKey();
+      const day = last.stats[key] ?? emptyDay();
+      return {
+        ...last,
+        stats: { ...last.stats, [key]: { ...day, skippedFocus: day.skippedFocus + (wasFocus ? 1 : 0) } },
+        sessionsDone,
+        mode: nextMode,
+        remaining: secondsFor(nextMode, last),
+      };
+    });
+    resetSegmentClock();
+  }
+
+  function addTask(scheduledFor?: string) {
+    const text = taskInput.trim();
+    if (!text) return;
+    const task: Task = {
+      id: uid(),
+      text,
+      done: false,
+      pomosDone: 0,
+      createdAt: Date.now(),
+      ...(isLocalDateKey(scheduledFor) ? { scheduledFor } : {}),
+    };
+    setState((prev) => ({ ...prev, tasks: [task, ...prev.tasks], activeTaskId: prev.activeTaskId ?? task.id }));
+    setTaskInput("");
+  }
+
+  function updateTaskSchedule(taskId: string, scheduledFor: string) {
+    const validDate = isLocalDateKey(scheduledFor) ? scheduledFor : undefined;
+    setState((prev) => ({
+      ...prev,
+      tasks: prev.tasks.map((task) => task.id === taskId ? { ...task, scheduledFor: validDate } : task),
+    }));
+  }
+
+  function toggleTaskDone(taskId: string) {
+    setState((prev) => ({
+      ...prev,
+      tasks: prev.tasks.map((task) => task.id === taskId ? { ...task, done: !task.done } : task),
+    }));
+  }
+
+  function deleteTask(taskId: string) {
+    setState((prev) => ({
+      ...prev,
+      tasks: prev.tasks.filter((task) => task.id !== taskId),
+      activeTaskId: prev.activeTaskId === taskId ? null : prev.activeTaskId,
+    }));
+  }
+
+  function selectTask(taskId: string) {
+    setState((prev) => ({ ...prev, activeTaskId: taskId }));
+  }
+
+  function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
+    setState((prev) => {
+      const next = { ...prev, settings: { ...prev.settings, [key]: value } };
+      if (!running && ["focusMinutes", "shortMinutes", "longMinutes"].includes(key)) {
+        next.remaining = secondsFor(prev.mode, next);
+      }
+      return next;
+    });
+  }
+
+  function patchFrame(id: PanelId, patch: Partial<WinFrame>) {
+    setState((prev) => ({
+      ...prev,
+      windows: { ...prev.windows, [id]: { ...(prev.windows[id] ?? defaultFrame()), ...patch } },
+    }));
+  }
+
+  const dateText = clock.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+  const clockText = state.settings.clock24h
+    ? clock.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })
+    : clock.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).toLowerCase();
+  const greeting =
+    clock.getHours() < 5 ? "still up" : clock.getHours() < 12 ? "good morning" : clock.getHours() < 17 ? "good afternoon" : clock.getHours() < 22 ? "good evening" : "still up";
+
+  const currentDayKey = todayKey();
+  const sevenDays = useMemo(() => {
+    const now = new Date();
+    return Array.from({ length: 7 }, (_, index) => {
+      const d = new Date(now);
+      d.setDate(now.getDate() - (6 - index));
+      return { key: todayKey(d), label: d.toLocaleDateString(undefined, { weekday: "narrow" }) };
+    });
+  }, [currentDayKey]);
+
+  /* Dots represent completed focus sessions only. They stay full through the
+     long break, then reset when the next focus cycle begins. */
+  const dotClass = (i: number): string => {
+    if (state.mode === "long") return "filled";
+    if (i < inCycle) return "filled";
+    return "";
+  };
+
+  const cycleCopy =
+    state.mode === "focus"
+      ? `Session ${inCycle + 1} of ${cycleLength}`
+      : state.mode === "short"
+        ? `Short break${inCycle ? ` · after session ${inCycle}` : ""}`
+        : "Long break · cycle complete";
+
+  const taskCounts = useMemo(() => {
+    const byDate = new Map<string, { remaining: number; done: number }>();
+    let remaining = 0;
+    let plannedRemaining = 0;
+
+    for (const task of state.tasks) {
+      if (!task.done) remaining += 1;
+      if (!task.scheduledFor) continue;
+      const counts = byDate.get(task.scheduledFor) ?? { remaining: 0, done: 0 };
+      if (task.done) counts.done += 1;
+      else {
+        counts.remaining += 1;
+        plannedRemaining += 1;
+      }
+      byDate.set(task.scheduledFor, counts);
+    }
+
+    return { byDate, remaining, plannedRemaining };
+  }, [state.tasks]);
+  const plannerMonthDays = useMemo(() => {
+    const selected = localDateFromKey(plannerDate);
+    const year = selected.getFullYear();
+    const month = selected.getMonth();
+    const first = new Date(year, month, 1, 12);
+    const leadingDays = (first.getDay() + 6) % 7;
+    const start = new Date(first);
+    start.setDate(1 - leadingDays);
+    const monthLength = new Date(year, month + 1, 0, 12).getDate();
+    const cellCount = Math.ceil((leadingDays + monthLength) / 7) * 7;
+
+    return Array.from({ length: cellCount }, (_, index) => {
+      const date = new Date(start);
+      date.setDate(start.getDate() + index);
+      return {
+        key: todayKey(date),
+        date,
+        inMonth: date.getMonth() === month && date.getFullYear() === year,
+      };
+    });
+  }, [plannerDate]);
+  const plannerWeekdays = useMemo(() => {
+    const monday = localDateFromKey(mondayOfWeek(plannerDate));
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(monday);
+      date.setDate(monday.getDate() + index);
+      return date.toLocaleDateString(undefined, { weekday: "short" });
+    });
+  }, [plannerDate]);
+  const plannerMonthLabel = useMemo(
+    () => localDateFromKey(plannerDate).toLocaleDateString(undefined, { month: "long", year: "numeric" }),
+    [plannerDate],
+  );
+  const selectedDayTasks = useMemo(
+    () => state.tasks
+      .filter((task) => task.scheduledFor === plannerDate)
+      .sort((a, b) => Number(a.done) - Number(b.done) || a.createdAt - b.createdAt),
+    [state.tasks, plannerDate],
+  );
+  const selectedDayDone = useMemo(
+    () => selectedDayTasks.filter((task) => task.done).length,
+    [selectedDayTasks],
+  );
+  const selectedDayRemaining = selectedDayTasks.length - selectedDayDone;
+
+  const totalTasks = state.tasks.length;
+  const doneTasks = totalTasks - taskCounts.remaining;
+  const taskPct = totalTasks > 0 ? (doneTasks / totalTasks) * 100 : 0;
+  const taskProgressNote =
+    totalTasks === 0
+      ? ""
+      : taskPct === 100
+        ? "Everything's done — take the win."
+        : doneTasks === 0
+          ? "Clear the first one."
+          : taskPct >= 75
+            ? "Almost there — finish strong."
+            : taskPct >= 50
+              ? "Past halfway. Keep going."
+              : `${totalTasks - doneTasks} left to go.`;
+
+  /* Switching tabs should feel like changing page, not like scrolling: the
+     panel goes back to the top every time. */
+  function switchPersonalTab(tab: PersonalTab) {
+    setPersonalTab(tab);
+    requestAnimationFrame(() => {
+      document.querySelectorAll<HTMLElement>(".fw-body").forEach((body) => {
+        if (body.querySelector(".panel-tabs [aria-selected='true']")) body.scrollTop = 0;
+      });
+    });
+  }
+
+  function handlePersonalTabKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
+    const tabs = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(
+        '[aria-label="Personalization sections"] [role="tab"]',
+      ),
+    );
+    const current = tabs.indexOf(event.currentTarget);
+    if (current < 0) return;
+
+    let next = current;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (current + 1) % tabs.length;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (current - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+
+    event.preventDefault();
+    const nextTab = tabs[next];
+    nextTab.focus();
+    const tabId: Record<string, PersonalTab> = {
+      "personal-tab-scenes": "scenes",
+      "personal-tab-themes": "themes",
+      "personal-tab-arrangement": "arrangement",
+    };
+    switchPersonalTab(tabId[nextTab.id] ?? "themes");
+  }
+
+  function selectArrangement(id: string) {
+    if (!isBuiltInArrangementId(id) && !state.customArrangements.some((item) => item.id === id)) return;
+    setState((prev) => ({ ...prev, arrangement: id }));
+  }
+
+  function startArrangementEdit() {
+    const startingPositions = selectedCustomArrangement?.positions ??
+      (isBuiltInArrangementId(state.arrangement) ? EDIT_START_POSITIONS[state.arrangement] : DEFAULT_LAYOUT_POSITIONS);
+    setDraftPositions(cloneLayoutPositions(startingPositions));
+    setArrangementName(selectedCustomArrangement ? `${selectedCustomArrangement.name} copy`.slice(0, 32) : "");
+    setArrangementEditing(true);
+    setDraggingItem(null);
+    setOpenPanels([]);
+    setUtilMenu(false);
+    setUtilTab(null);
+  }
+
+  function cancelArrangementEdit() {
+    arrangementDrag.current = null;
+    setDraggingItem(null);
+    setArrangementEditing(false);
+    setDraftPositions(null);
+    setArrangementName("");
+    setPersonalTab("arrangement");
+    openPanel("personal");
+  }
+
+  function saveArrangementPreset() {
+    const name = arrangementName.trim().slice(0, 32);
+    if (!name) return;
+    const preset: CustomArrangement = {
+      id: `custom-${uid()}`,
+      name,
+      positions: cloneLayoutPositions(draftPositions ?? DEFAULT_LAYOUT_POSITIONS),
+    };
+    setState((prev) => ({
+      ...prev,
+      customArrangements: [...prev.customArrangements, preset].slice(-24),
+      arrangement: preset.id,
+    }));
+    setArrangementEditing(false);
+    setDraftPositions(null);
+    setDraggingItem(null);
+    arrangementDrag.current = null;
+    setArrangementName("");
+    setPersonalTab("arrangement");
+    openPanel("personal");
+  }
+
+  function deleteArrangementPreset(id: string) {
+    setState((prev) => ({
+      ...prev,
+      customArrangements: prev.customArrangements.filter((item) => item.id !== id),
+      arrangement: prev.arrangement === id ? "classic" : prev.arrangement,
+    }));
+  }
+
+  function beginArrangementDrag(event: React.PointerEvent<HTMLButtonElement>, item: StageItemId) {
+    if (event.button !== 0) return;
+    const stage = stageRef.current;
+    const currentPosition = stagePositions?.[item] ?? DEFAULT_LAYOUT_POSITIONS[item];
+    const bounds = stage?.getBoundingClientRect();
+    if (!bounds || bounds.width <= 0 || bounds.height <= 0) return;
+    arrangementDrag.current = {
+      item,
+      startX: event.clientX,
+      startY: event.clientY,
+      startPosition: { ...currentPosition },
+      stageWidth: bounds.width,
+      stageHeight: bounds.height,
+    };
+    setDraggingItem(item);
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveArrangementItem(event: React.PointerEvent<HTMLButtonElement>, item: StageItemId) {
+    const drag = arrangementDrag.current;
+    if (!drag || drag.item !== item) return;
+    const nextPosition = {
+      x: clamp(drag.startPosition.x + ((event.clientX - drag.startX) / drag.stageWidth) * 100, 4, 96),
+      y: clamp(drag.startPosition.y + ((event.clientY - drag.startY) / drag.stageHeight) * 100, 5, 95),
+    };
+    setDraftPositions((prev) => prev ? { ...prev, [item]: nextPosition } : prev);
+  }
+
+  function endArrangementDrag() {
+    arrangementDrag.current = null;
+    setDraggingItem(null);
+  }
+
+  function nudgeArrangementItem(event: React.KeyboardEvent<HTMLButtonElement>, item: StageItemId) {
+    const steps: Record<string, [number, number]> = {
+      ArrowLeft: [-2, 0],
+      ArrowRight: [2, 0],
+      ArrowUp: [0, -2],
+      ArrowDown: [0, 2],
+    };
+    const step = steps[event.key];
+    if (!step) return;
+    event.preventDefault();
+    setDraftPositions((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        [item]: {
+          x: clamp(prev[item].x + step[0] * (event.shiftKey ? 2.5 : 1), 4, 96),
+          y: clamp(prev[item].y + step[1] * (event.shiftKey ? 2.5 : 1), 5, 95),
+        },
+      };
+    });
+  }
+
+  /* Themes and Scenes share one panel now: two tabs of the same subject.
+     Their bodies live here so the tab bar stays readable. */
+  const themesBody = () => (
+    <>
+      <p className="field-hint">
+        A theme restyles everything — type, buttons, surfaces, corners, depth and colour. Original is the default;
+        your tasks, stats and notes are untouched.
+      </p>
+
+      {DESIGN_GROUPS.map((group) => (
+        <div className="design-group" key={group.id}>
+          <div className="design-group-head">
+            <span>{group.label}</span>
+            <small>{group.note}</small>
+          </div>
+          <div className="design-grid" role="radiogroup" aria-label={group.label}>
+            {DESIGNS.filter((item) => item.group === group.id).map((item) => {
+              const active = state.design === item.id;
+              return (
+                <button
+                  key={item.id}
+                  role="radio"
+                  aria-checked={active}
+                  data-preview={item.id}
+                  className={`design-card ${active ? "active" : ""}`}
+                  onClick={() => chooseDesign(item.id)}
+                  title={item.tagline}
+                >
+                  <span className="design-thumb" aria-hidden="true">
+                    <span className="dt-dots"><i /><i /><i /><i /></span>
+                    <b className="dt-time">25:00</b>
+                    <span className="dt-row">
+                      <i className="dt-round" />
+                      <i className="dt-start" />
+                      <i className="dt-round" />
+                    </span>
+                  </span>
+                  <span className="design-card-name">
+                    {item.name}
+                    {item.id === DEFAULT_DESIGN && <em>default</em>}
+                  </span>
+                  <span className="design-card-tag">{item.tagline}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+
+      <div className="theme-block">
+        <div className="theme-head">
+          <span>Accent color</span>
+          <i className="theme-preview" style={{ background: hslToHex(hue, accentSat, accentLight) }} aria-hidden="true" />
+        </div>
+
+        <div className="swatch-grid">
+          {THEME_SWATCHES.map((hexValue) => {
+            const swatchHue = hexToHue(hexValue);
+            const active = customHue !== null && Math.abs(((customHue - swatchHue + 540) % 360) - 180) < 6;
+            return (
+              <button
+                key={hexValue}
+                className={`swatch ${active ? "active" : ""}`}
+                style={{ background: hexValue }}
+                onClick={() => setAccentHue(swatchHue)}
+                aria-label={`Use ${hexValue} as the accent color`}
+                title={hexValue}
+              />
+            );
+          })}
+        </div>
+
+        <input
+          className="hue-slider"
+          type="range"
+          min={0}
+          max={359}
+          value={Math.round(hue)}
+          onChange={(event) => setAccentHue(Number(event.target.value))}
+          aria-label="Accent hue"
+        />
+
+        <button className="theme-reset" onClick={() => setAccentHue(null)} disabled={customHue == null}>
+          {preset.accent ? `Reset to ${preset.name} palette` : "Reset to scene color"}
+        </button>
+
+        {/* The tint is the only thing between a wallpaper and the type, so it
+            gets an off switch right where colours are chosen. */}
+        <TintButton
+          tinted={state.settings.wallTint}
+          wallpaper={Boolean(wallpaper)}
+          onToggle={() => updateSetting("wallTint", !state.settings.wallTint)}
+        />
+      </div>
+
+      <p className="field-hint">
+        Wallpapers, weather layers and custom backgrounds live on the Scenes tab — a wallpaper you pick there shows
+        behind every preset. Choose Pure Black for no wallpaper.
+      </p>
+      <button className="theme-link" onClick={() => switchPersonalTab("scenes")}>Wallpapers &amp; scenes →</button>
+    </>
+  );
+
+  const scenesBody = () => (
+    <>
+      <div className="switch-row">
+        <span>Adapt to time of day</span>
+        <button className={state.sceneAuto ? "switch on" : "switch"} onClick={() => setState((prev) => ({ ...prev, sceneAuto: !prev.sceneAuto }))} />
+      </div>
+      <div className="scene-grid">
+        {(Object.keys(sceneLabels) as SceneId[]).map((scene) => (
+          <button
+            key={scene}
+            className={`scene-pick mini-${scene} ${!state.sceneAuto && state.scene === scene ? "active" : ""}`}
+            onClick={() =>
+              setState((prev) => ({
+                ...prev,
+                scene,
+                sceneExplicit: scene !== "pure" || prev.sceneExplicit,
+                sceneAuto: false,
+                customImage: "",
+                customYoutube: "",
+              }))
+            }
+          >
+            {sceneLabels[scene]}
+          </button>
+        ))}
+      </div>
+      <p className="field-hint">
+        A scene, image or video you pick here becomes your wallpaper and shows behind <b>every</b> theme — pick
+        &ldquo;Pure&rdquo; to go back to the theme&rsquo;s own background. The accent color follows the scene unless a
+        preset or your own pick sets it.
+      </p>
+
+      <label className="field"><span>Custom image URL</span><input value={imageInput} onChange={(event) => setImageInput(event.target.value)} placeholder="https://..." /></label>
+      <button className="panel-primary" onClick={() => setState((prev) => ({ ...prev, customImage: imageInput.trim(), customYoutube: "" }))}>Use image</button>
+      <label className="field"><span>YouTube URL</span><input value={youtubeInput} onChange={(event) => setYoutubeInput(event.target.value)} placeholder="https://youtube.com/watch?v=..." /></label>
+      <button className="panel-primary subtle" onClick={() => setState((prev) => ({ ...prev, customYoutube: youtubeInput.trim(), customImage: "" }))}>Use video background</button>
+      <button className="panel-danger" onClick={() => setState((prev) => ({ ...prev, customImage: "", customYoutube: "" }))}>Clear custom background</button>
+      <TintButton
+        tinted={state.settings.wallTint}
+        wallpaper={Boolean(wallpaper)}
+        onToggle={() => updateSetting("wallTint", !state.settings.wallTint)}
+      />
+      <button className="theme-link" onClick={() => switchPersonalTab("themes")}>Themes, palettes &amp; accent color →</button>
+    </>
+  );
+
+  function renderArrangementPreview(id: string, positions?: LayoutPositions) {
+    return (
+      <div className={`arrangement-preview arrangement-preview--${id}`} aria-hidden="true">
+        {STAGE_ITEM_IDS.map((item) => (
+          <i
+            key={item}
+            className={`layout-preview-item layout-preview-item--${item}`}
+            style={positions ? { left: `${positions[item].x}%`, top: `${positions[item].y}%` } : undefined}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  function renderArrangementBody(): React.ReactNode {
+    return (
+      <>
+        <p className="field-hint arrangement-intro">
+          Choose where the timer and controls sit. Start with a layout below, or customize it and drag the timer, mode tabs,
+          controls, and task chip directly on the screen.
+        </p>
+
+        <div className="arrangement-grid" role="group" aria-label="Built-in timer arrangements">
+          {BUILT_IN_ARRANGEMENTS.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              aria-pressed={state.arrangement === item.id}
+              className={`arrangement-card ${state.arrangement === item.id ? "active" : ""}`}
+              onClick={() => selectArrangement(item.id)}
+            >
+              {renderArrangementPreview(item.id)}
+              <span className="arrangement-copy">
+                <strong>{item.name}</strong>
+                <small>{item.description}</small>
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <div className="saved-arrangements">
+          <div className="arrangement-section-head">
+            <strong>Saved layouts</strong>
+            <small>{state.customArrangements.length}/24</small>
+          </div>
+          {state.customArrangements.length === 0 ? (
+            <p className="arrangement-empty">Your custom presets will appear here.</p>
+          ) : (
+            <div className="saved-arrangement-list" role="group" aria-label="Saved layouts">
+              {[...state.customArrangements].reverse().map((item) => (
+                <div className="saved-arrangement-row" key={item.id}>
+                  <button
+                    type="button"
+                    aria-pressed={state.arrangement === item.id}
+                    className={`saved-arrangement ${state.arrangement === item.id ? "active" : ""}`}
+                    onClick={() => selectArrangement(item.id)}
+                  >
+                    {renderArrangementPreview("custom", item.positions)}
+                    <span className="arrangement-copy">
+                      <strong>{item.name}</strong>
+                      <small>Custom arrangement</small>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="arrangement-delete"
+                    aria-label={`Delete ${item.name}`}
+                    title={`Delete ${item.name}`}
+                    onClick={() => deleteArrangementPreset(item.id)}
+                  >
+                    <Icon name="trash" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <button className="panel-primary arrangement-edit-button" onClick={startArrangementEdit}>
+          {selectedCustomArrangement ? "Edit selected layout" : "Customize current layout"}
+        </button>
+        <p className="arrangement-tip">
+          Editing opens a clear canvas. Drag each outlined piece, then name and save your own preset.
+          Use arrow keys for precise placement.
+        </p>
+      </>
+    );
+  }
+
+  function renderStageItem(item: StageItemId, label: string, content: React.ReactNode) {
+    const position = stagePositions?.[item] ?? DEFAULT_LAYOUT_POSITIONS[item];
+    const style = stageArrangement === "custom"
+      ? { "--item-x": `${position.x}%`, "--item-y": `${position.y}%` } as React.CSSProperties
+      : undefined;
+    return (
+      <div
+        key={item}
+        className={`stage-layout-item stage-layout-item--${item} ${draggingItem === item ? "is-dragging" : ""}`}
+        data-layout-item={item}
+        style={style}
+      >
+        <div className="stage-layout-item-content" inert={arrangementEditing}>
+          {content}
+        </div>
+        {arrangementEditing && (
+          <button
+            type="button"
+            className="layout-drag-handle"
+            aria-label={`Move ${label}. Use arrow keys to reposition.`}
+            title={`Drag to move ${label}; use arrow keys for precision`}
+            onPointerDown={(event) => beginArrangementDrag(event, item)}
+            onPointerMove={(event) => moveArrangementItem(event, item)}
+            onPointerUp={endArrangementDrag}
+            onPointerCancel={endArrangementDrag}
+            onLostPointerCapture={endArrangementDrag}
+            onKeyDown={(event) => nudgeArrangementItem(event, item)}
+          >
+            <span className="layout-drag-grip" aria-hidden="true">⠿</span>
+            <span>Move {label}</span>
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  function renderStatsPanel(): React.ReactNode {
+    const todayStats = state.stats[currentDayKey] ?? emptyDay();
+    const focusSec = todayStats.focusSec;
+    const breakSec = todayStats.breakSec;
+    const idleSec = todayStats.idleSec;
+    const trackedSec = focusSec + breakSec + idleSec;
+    const pct = (value: number) => (trackedSec > 0 ? (value / trackedSec) * 100 : 0);
+    const focusBreakRatio =
+      breakSec > 0 ? `${(focusSec / breakSec).toFixed(1)} : 1` : focusSec > 0 ? "∞ : 0" : "—";
+    const productivity = Math.round(pct(focusSec));
+    const maxDay = Math.max(1, ...sevenDays.map((day) => state.stats[day.key]?.focusSec ?? 0));
+
+    const totalSessions =
+      totalSessionsCache.current?.sessionsDone === state.sessionsDone
+        ? totalSessionsCache.current.value
+        : Object.values(state.stats).reduce((sum, day) => sum + (day.sessions ?? 0), 0);
+    if (totalSessionsCache.current?.sessionsDone !== state.sessionsDone) {
+      totalSessionsCache.current = { sessionsDone: state.sessionsDone, value: totalSessions };
+    }
+
+    const streakEntry = streakCache.current;
+    let streak: number;
+    if (streakEntry?.dayKey === currentDayKey && streakEntry.sessionsDone === state.sessionsDone) {
+      streak = streakEntry.value;
+    } else {
+      const now = new Date();
+      streak = 0;
+      for (let i = 0; i < 365; i += 1) {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i);
+        const rec = state.stats[todayKey(d)];
+        if (rec?.sessions) streak += 1;
+        else if (i !== 0) break;
+      }
+      streakCache.current = { dayKey: currentDayKey, sessionsDone: state.sessionsDone, value: streak };
+    }
+
+    return (
+      <>
+        <div className="today-hero">
+          <div
+            className="focus-dial"
+            style={{ "--deg": `${pct(focusSec) * 3.6}deg` } as React.CSSProperties}
+            role="img"
+            aria-label={`${productivity}% of tracked time was focus`}
+          >
+            <div className="focus-dial-core">
+              <strong>{productivity}%</strong>
+              <span>focused</span>
+            </div>
+          </div>
+          <div className="today-figures">
+            <div className="figure focus">
+              <i /><span>Focus</span><b>{formatDuration(focusSec)}</b>
+            </div>
+            <div className="figure leisure">
+              <i /><span>Leisure</span><b>{formatDuration(breakSec)}</b>
+            </div>
+            <div className="figure misc">
+              <i /><span>Misc / Unproductive</span><b>{formatDuration(idleSec)}</b>
+            </div>
+          </div>
+        </div>
+
+        <div className="split-bar" aria-label="Today time split">
+          <div className="split-track">
+            <i className="seg-focus" style={{ width: `${pct(focusSec)}%` }} title={`Focus ${formatDuration(focusSec)}`} />
+            <i className="seg-leisure" style={{ width: `${pct(breakSec)}%` }} title={`Leisure ${formatDuration(breakSec)}`} />
+            <i className="seg-misc" style={{ width: `${pct(idleSec)}%` }} title={`Misc ${formatDuration(idleSec)}`} />
+          </div>
+          <div className="split-legend">
+            <span><i className="seg-focus" />{Math.round(pct(focusSec))}%</span>
+            <span><i className="seg-leisure" />{Math.round(pct(breakSec))}%</span>
+            <span><i className="seg-misc" />{Math.round(pct(idleSec))}%</span>
+          </div>
+        </div>
+
+        <div className="stat-row">
+          <div><strong>{focusBreakRatio}</strong><span>Focus : leisure</span></div>
+          <div><strong>{todayStats.sessions}</strong><span>Done today</span></div>
+          <div><strong>{todayStats.skippedFocus}</strong><span>Skipped</span></div>
+          <div><strong>{streak}</strong><span>Day streak</span></div>
+          <div><strong>{totalSessions}</strong><span>All sessions</span></div>
+          <div><strong>{formatDuration(trackedSec)}</strong><span>Tracked</span></div>
+        </div>
+
+        <div>
+          <div className="chart-head">
+            <span>Last 7 days</span>
+            <small>focus vs leisure</small>
+          </div>
+          <div className="chart">
+            {sevenDays.map((day) => {
+              const record = state.stats[day.key] ?? emptyDay();
+              const isToday = day.key === todayKey();
+              return (
+                <div key={day.key} className={isToday ? "today" : ""}>
+                  <div className="bar-stack" title={`Focus ${formatDuration(record.focusSec)} · Leisure ${formatDuration(record.breakSec)}`}>
+                    <span className="bar-leisure" style={{ height: `${(record.breakSec / maxDay) * 100}%` }} />
+                    <span className="bar-focus" style={{ height: `${Math.max(record.focusSec > 0 ? 4 : 2, (record.focusSec / maxDay) * 100)}%` }} />
+                  </div>
+                  <small>{day.label}</small>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  const panelContent: Record<PanelId, () => React.ReactNode> = {
+    tasks: () => (
+      <>
+        <div className="panel-tabs task-view-tabs" role="group" aria-label="Task views">
+          <button
+            type="button"
+            className={taskView === "tasks" ? "active" : ""}
+            aria-pressed={taskView === "tasks"}
+            onClick={() => setTaskView("tasks")}
+          >
+            <span>Tasks</span><small>{taskCounts.remaining}</small>
+          </button>
+          <button
+            type="button"
+            className={taskView === "planner" ? "active" : ""}
+            aria-pressed={taskView === "planner"}
+            onClick={() => setTaskView("planner")}
+          >
+            <Icon name="calendar" /><span>Planner</span><small>{taskCounts.plannedRemaining}</small>
+          </button>
+        </div>
+
+        {taskView === "tasks" ? (
+          <>
+            {totalTasks > 0 && (
+              <div className={`task-progress ${taskPct === 100 ? "complete" : ""}`}>
+                <div className="task-progress-head">
+                  <span>Progress</span>
+                  <b>{doneTasks}/{totalTasks}</b>
+                </div>
+                <div
+                  className="task-progress-track"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={totalTasks}
+                  aria-valuenow={doneTasks}
+                  aria-label={`${doneTasks} of ${totalTasks} tasks complete`}
+                >
+                  <i style={{ width: `${taskPct}%` }} />
+                </div>
+                <div className="task-progress-foot">
+                  <small>{Math.round(taskPct)}% complete</small>
+                  <em>{taskProgressNote}</em>
+                </div>
+              </div>
+            )}
+            <div className="add-row">
+              <input
+                aria-label="Add a task"
+                value={taskInput}
+                onChange={(event) => setTaskInput(event.target.value)}
+                onKeyDown={(event) => event.key === "Enter" && addTask()}
+                placeholder="Add what you are working on"
+                maxLength={140}
+              />
+              <button type="button" onClick={() => addTask()} aria-label="Add task"><Icon name="plus" /></button>
+            </div>
+            <div className="task-list" role="list" aria-label="Tasks">
+              {state.tasks.length === 0 && <p className="empty-copy">No tasks yet. Add one precise target for the next session.</p>}
+              {state.tasks.map((task) => (
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  active={task.id === state.activeTaskId}
+                  onSelect={() => selectTask(task.id)}
+                  onToggle={() => toggleTaskDone(task.id)}
+                  onDelete={() => deleteTask(task.id)}
+                  onSchedule={(date) => updateTaskSchedule(task.id, date)}
+                />
+              ))}
+            </div>
+          </>
+        ) : (
+          <div className="planner-view">
+            <div className="planner-month-heading">
+              <div>
+                <small>Monthly planner</small>
+                <strong>{plannerMonthLabel}</strong>
+              </div>
+              <div className="planner-month-controls">
+                <button type="button" className="icon-button" onClick={() => setPlannerDate((date) => addMonthsToKey(date, -1))} aria-label="Previous month" title="Previous month">
+                  <Icon name="back" />
+                </button>
+                <button type="button" className="planner-today" onClick={() => setPlannerDate(todayKey())}>Today</button>
+                <button type="button" className="icon-button" onClick={() => setPlannerDate((date) => addMonthsToKey(date, 1))} aria-label="Next month" title="Next month">
+                  <Icon name="next" />
+                </button>
+              </div>
+            </div>
+            <div className="planner-weekdays" aria-hidden="true">
+              {plannerWeekdays.map((weekday, index) => <span key={`${index}-${weekday}`}>{weekday}</span>)}
+            </div>
+            <div className="planner-month-grid" role="group" aria-label={`Choose a day in ${plannerMonthLabel}`}>
+              {plannerMonthDays.map(({ key, date, inMonth }) => {
+                const counts = taskCounts.byDate.get(key);
+                const isToday = key === todayKey();
+                const detail = counts
+                  ? `${counts.remaining} remaining, ${counts.done} done`
+                  : "No planned tasks";
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    className={`planner-day ${plannerDate === key ? "active" : ""} ${isToday ? "is-today" : ""} ${inMonth ? "" : "is-outside"}`}
+                    data-date={key}
+                    aria-pressed={plannerDate === key}
+                    aria-current={isToday ? "date" : undefined}
+                    aria-label={`${formatLongDate(key)}. ${detail}.`}
+                    onClick={() => setPlannerDate(key)}
+                  >
+                    <span>{date.getDate()}</span>
+                    <small>{counts?.remaining ? counts.remaining > 9 ? "9+" : counts.remaining : counts?.done ? "✓" : ""}</small>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="planner-day-summary">
+              <div>
+                <strong>{formatLongDate(plannerDate)}</strong>
+                <small>
+                  {selectedDayTasks.length === 0
+                    ? "A clear day is room for a win."
+                    : `${selectedDayRemaining} left · ${selectedDayDone} done`}
+                </small>
+              </div>
+              <span className={`planner-day-total ${selectedDayRemaining === 0 && selectedDayDone > 0 ? "is-complete" : ""}`}>
+                {selectedDayRemaining === 0 && selectedDayDone > 0 ? <Icon name="check" /> : selectedDayRemaining}
+              </span>
+            </div>
+            <div className="add-row planner-add-row">
+              <input
+                aria-label={`Add task for ${formatLongDate(plannerDate)}`}
+                value={taskInput}
+                onChange={(event) => setTaskInput(event.target.value)}
+                onKeyDown={(event) => event.key === "Enter" && addTask(plannerDate)}
+                placeholder="Add a task to this day"
+                maxLength={140}
+              />
+              <button type="button" onClick={() => addTask(plannerDate)} aria-label="Add task to planner"><Icon name="plus" /></button>
+            </div>
+            <p className="planner-sync-note">Plan it here, finish it anywhere — these are the same tasks as your list.</p>
+            <div className="task-list planner-task-list" role="list" aria-label={`Tasks for ${formatLongDate(plannerDate)}`}>
+              {selectedDayTasks.length === 0 && (
+                <p className="empty-copy planner-empty">Nothing planned yet. Add a small win above, or schedule a task from Tasks.</p>
+              )}
+              {selectedDayTasks.map((task) => (
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  active={task.id === state.activeTaskId}
+                  onSelect={() => selectTask(task.id)}
+                  onToggle={() => toggleTaskDone(task.id)}
+                  onDelete={() => deleteTask(task.id)}
+                  onSchedule={(date) => updateTaskSchedule(task.id, date)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+      </>
+    ),
+    music: () => (
+      <>
+        <div className="panel-tabs">
+          <button className={musicTab === "spotify" ? "active" : ""} onClick={() => setMusicTab("spotify")}>Spotify</button>
+          <button className={musicTab === "youtube" ? "active" : ""} onClick={() => setMusicTab("youtube")}>YouTube Music</button>
+        </div>
+
+        {musicTab === "spotify" && (
+          <>
+            <label className="field"><span>Spotify link</span><input value={spotifyInput} onChange={(event) => setSpotifyInput(event.target.value)} onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              const parsed = spotifyFromUrl(spotifyInput.trim());
+              if (!parsed) return notify("Paste a valid Spotify track, album, or playlist link.");
+              setState((prev) => ({ ...prev, spotify: parsed }));
+            }} placeholder="https://open.spotify.com/playlist/..." /></label>
+            <button
+              className="panel-primary"
+              onClick={() => {
+                const parsed = spotifyFromUrl(spotifyInput.trim());
+                if (!parsed) return notify("Paste a valid Spotify track, album, or playlist link.");
+                setState((prev) => ({ ...prev, spotify: parsed }));
+              }}
+            >
+              Load player
+            </button>
+            {state.spotify ? (
+              <>
+                <iframe
+                  className="spotify-frame"
+                  src={`https://open.spotify.com/embed/${state.spotify.type}/${state.spotify.id}?utm_source=generator&theme=0`}
+                  allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                  title="Spotify player"
+                />
+                <button className="panel-danger" onClick={() => setState((prev) => ({ ...prev, spotify: null }))}>Remove player</button>
+              </>
+            ) : (
+              <p className="empty-copy">Paste a public Spotify playlist, album, or track link. It plays right here — no new tab, no leaving the app.</p>
+            )}
+          </>
+        )}
+
+        {musicTab === "youtube" && (
+          <>
+            <label className="field">
+              <span>YouTube / YouTube Music link</span>
+              <input
+                value={ytMusicInput}
+                onChange={(event) => setYtMusicInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  const value = ytMusicInput.trim();
+                  if (!value) return;
+                  setState((prev) => ({ ...prev, youtubeMusicUrl: value }));
+                }}
+                placeholder="https://music.youtube.com/playlist?list=..."
+              />
+            </label>
+            <button
+              className="panel-primary"
+              onClick={() => {
+                const value = ytMusicInput.trim();
+                if (!value) return notify("Paste a YouTube video or playlist link first.");
+                setState((prev) => ({ ...prev, youtubeMusicUrl: value }));
+              }}
+            >
+              Load audio
+            </button>
+            {state.youtubeMusicUrl ? (
+              <>
+                <Suspense fallback={<p className="empty-copy">Loading player…</p>}>
+                  <YouTubeAudioPlayer url={state.youtubeMusicUrl} />
+                </Suspense>
+                <button className="panel-danger" onClick={() => setState((prev) => ({ ...prev, youtubeMusicUrl: "" }))}>Remove player</button>
+              </>
+            ) : (
+              <p className="empty-copy">Paste any YouTube or YouTube Music video/playlist link. Only the audio plays — the video is never shown.</p>
+            )}
+          </>
+        )}
+      </>
+    ),
+    personal: () => (
+      <>
+        <div className="panel-tabs personal-section-tabs" role="tablist" aria-label="Personalization sections">
+          <button
+            id="personal-tab-scenes"
+            role="tab"
+            aria-controls="personal-tabpanel"
+            aria-selected={personalTab === "scenes"}
+            tabIndex={personalTab === "scenes" ? 0 : -1}
+            className={personalTab === "scenes" ? "active" : ""}
+            onClick={() => switchPersonalTab("scenes")}
+            onKeyDown={handlePersonalTabKeyDown}
+          >
+            Scenes
+          </button>
+          <button
+            id="personal-tab-themes"
+            role="tab"
+            aria-controls="personal-tabpanel"
+            aria-selected={personalTab === "themes"}
+            tabIndex={personalTab === "themes" ? 0 : -1}
+            className={personalTab === "themes" ? "active" : ""}
+            onClick={() => switchPersonalTab("themes")}
+            onKeyDown={handlePersonalTabKeyDown}
+          >
+            Themes
+          </button>
+          <button
+            id="personal-tab-arrangement"
+            role="tab"
+            aria-controls="personal-tabpanel"
+            aria-selected={personalTab === "arrangement"}
+            tabIndex={personalTab === "arrangement" ? 0 : -1}
+            className={personalTab === "arrangement" ? "active" : ""}
+            onClick={() => switchPersonalTab("arrangement")}
+            onKeyDown={handlePersonalTabKeyDown}
+            aria-label="Arrangement / Orientation"
+          >
+            <span className="personal-tab-label-full">Arrangement / Orientation</span>
+            <span className="personal-tab-label-short" aria-hidden="true">Arrange</span>
+          </button>
+        </div>
+
+        <div
+          id="personal-tabpanel"
+          className="personal-tabpanel"
+          role="tabpanel"
+          aria-labelledby={`personal-tab-${personalTab}`}
+          tabIndex={0}
+        >
+          {personalTab === "themes"
+            ? themesBody()
+            : personalTab === "scenes"
+              ? scenesBody()
+              : renderArrangementBody()}
+        </div>
+      </>
+    ),
+    stats: () => renderStatsPanel(),
+    notes: () => <NotesNotebook legacyText={state.notes} onLegacyConsumed={consumeLegacyNotes} />,
+    settings: () => (
+      <>
+        <label className="field"><span>Your name</span><input value={state.settings.name} onChange={(event) => updateSetting("name", event.target.value.slice(0, 24))} placeholder="optional" /></label>
+        <div className="settings-grid">
+          <NumberField label="Focus (min)" value={state.settings.focusMinutes} min={1} max={180} onChange={(value) => updateSetting("focusMinutes", value)} />
+          <NumberField label="Short break (min)" value={state.settings.shortMinutes} min={1} max={60} onChange={(value) => updateSetting("shortMinutes", value)} />
+          <NumberField label="Long break (min)" value={state.settings.longMinutes} min={1} max={90} onChange={(value) => updateSetting("longMinutes", value)} />
+          <NumberField label="Sessions before long break" value={state.settings.sessionsBeforeLong} min={2} max={12} onChange={(value) => updateSetting("sessionsBeforeLong", value)} />
+          <NumberField label="Check-in (min)" value={state.settings.checkInMinutes} min={3} max={60} onChange={(value) => updateSetting("checkInMinutes", value)} />
+        </div>
+        <ToggleRow label="Auto-start breaks" value={state.settings.autoStartBreaks} onChange={(value) => updateSetting("autoStartBreaks", value)} />
+        <ToggleRow label="Auto-start next focus" value={state.settings.autoStartFocus} onChange={(value) => updateSetting("autoStartFocus", value)} />
+        <ToggleRow label="24-hour clock" value={state.settings.clock24h} onChange={(value) => updateSetting("clock24h", value)} />
+        <ToggleRow label="Focus check-ins" value={state.settings.checkIns} onChange={(value) => updateSetting("checkIns", value)} />
+        {soundSupported() && (
+          <ToggleRow label="Interface sounds (per theme)" value={state.settings.uiSound} onChange={(value) => updateSetting("uiSound", value)} />
+        )}
+        <button className="panel-danger" onClick={() => {
+          localStorage.removeItem(STORE_KEY);
+          localStorage.removeItem(PREV_STORE_KEY);
+          clearAttentionStore();
+          void clearNotebookStorage()
+            .catch((error: unknown) => window.alert(error instanceof Error ? error.message : "Notebook data could not be erased."))
+            .finally(() => window.location.reload());
+        }}>Erase local data</button>
+      </>
+    ),
+    attention: () => <AttentionGuardPanel controller={attentionController} store={attentionStore} updateStore={updateAttentionStore} focusTimerActive={focusTimerActive} timerMode={state.mode} onStartFocusTimer={startFocusTimerFromAttention} />,
+  };
+
+  const panelMeta: Record<PanelId, { title: string; icon: string }> = {
+    tasks: { title: "Tasks", icon: "task" },
+    music: { title: "Music", icon: "music" },
+    personal: { title: "Personalization", icon: "palette" },
+    stats: { title: "Focus Stats", icon: "stats" },
+    notes: { title: "Notes", icon: "note" },
+    settings: { title: "Settings", icon: "settings" },
+    attention: { title: "Attention Guard", icon: "attention" },
+  };
+
+  const dockItems: [PanelId, string][] = [
+    ["tasks", "task"],
+    ["music", "music"],
+    ["personal", "palette"],
+    ["stats", "stats"],
+    ["notes", "note"],
+    ["attention", "attention"],
+    ["settings", "settings"],
+  ];
+
+  return (
+    <main
+      className={`focus-app scene-${effectiveScene} ${running ? "is-running" : ""} ${utilTab ? "util-open" : ""}`}
+      data-design={state.design}
+      data-tone={preset.tone}
+      data-wallpaper={wallpaper || undefined}
+      data-tint={state.settings.wallTint ? undefined : "off"}
+      style={{ ...themeVars, "--util-w": `${utilWidth}px` } as React.CSSProperties}
+    >
+      <div className="visual-plane" />
+      {(wallpaperImage || ytId) && (
+        <div
+          className="wallpaper-plane"
+          style={wallpaperImage ? { backgroundImage: `url(${wallpaperImage})` } : undefined}
+          aria-hidden="true"
+        />
+      )}
+      {ytId && (
+        <iframe
+          className="video-plane"
+          src={`https://www.youtube-nocookie.com/embed/${ytId}?autoplay=1&mute=1&loop=1&playlist=${ytId}&controls=0&modestbranding=1&playsinline=1`}
+          allow="autoplay; encrypted-media"
+          title="Custom background video"
+        />
+      )}
+      {(wallpaperImage || ytId) && <div className="wallpaper-veil" aria-hidden="true" />}
+      <div className="rain-layer" />
+      <div className="snow-layer" />
+      <div className="scrim" />
+      {preset.motion && <MotionFx variant={preset.motion} running={running} />}
+
+      <header className="topbar">
+        <div className="greeting">
+          <span className="greet-line">{greeting}{state.settings.name ? `, ${state.settings.name}` : ""}</span>
+          <span className="greet-clock">{clockText}</span>
+          <span className="greet-date">{dateText}</span>
+        </div>
+        <div className="top-quote">&ldquo;{quotes[quoteIndex]}&rdquo;</div>
+      </header>
+      <AttentionCameraIndicator controller={attentionController} onOpen={() => openPanel("attention")} />
+
+      <div className="workspace">
+        {utilTab && (
+          <section className="util-panel" aria-label="Utilities" style={utilHeight ? { height: utilHeight, flex: "0 0 auto" } : undefined}>
+            <div className="util-head">
+              <div className="util-tabs">
+                {([["youtube", "youtube", "YouTube"], ["web", "globe", "Web"], ["files", "doc", "Files"]] as [UtilId, string, string][]).map(
+                  ([id, icon, label]) => (
+                    <button key={id} className={utilTab === id ? "active" : ""} onClick={() => setUtilTab(id)}>
+                      <Icon name={icon} />
+                      <span>{label}</span>
+                    </button>
+                  ),
+                )}
+              </div>
+              <button className="icon-button" onClick={() => setUtilTab(null)} aria-label="Close utilities"><Icon name="close" /></button>
+            </div>
+
+            {utilTab === "youtube" && (
+              <div className="util-content">
+                <div className="util-bar">
+                  <input
+                    value={studyInput}
+                    onChange={(event) => setStudyInput(event.target.value)}
+                    onKeyDown={(event) => event.key === "Enter" && loadStudyVideo()}
+                    placeholder="Paste a YouTube link…"
+                    aria-label="YouTube link"
+                  />
+                  <button className="util-go" onClick={loadStudyVideo}>Load</button>
+                </div>
+                <div className="util-view">
+                  {studyId ? (
+                    <iframe
+                      key={studyId}
+                      src={`https://www.youtube-nocookie.com/embed/${studyId}?autoplay=1&rel=0&modestbranding=1&playsinline=1`}
+                      title="YouTube study stream"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                      allowFullScreen
+                    />
+                  ) : (
+                    <div className="util-empty">
+                      <Icon name="youtube" />
+                      <p>Paste a YouTube link to start your study stream.</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {utilTab === "web" && (
+              <div className="util-content">
+                <div className="util-bar">
+                  <button className="icon-button" onClick={goBack} disabled={!history.length} aria-label="Back" title="Back"><Icon name="back" /></button>
+                  <button className="icon-button" onClick={() => setBrowserNonce((n) => n + 1)} aria-label="Reload page" title="Reload"><Icon name="refresh" /></button>
+                  <input
+                    value={browserInput}
+                    onChange={(event) => setBrowserInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        goToBrowserTarget(browserInput);
+                        setBrowserInput("");
+                      }
+                    }}
+                    placeholder="Search the web or enter a URL…"
+                    aria-label="Search or URL"
+                  />
+                  <button className="util-go" onClick={() => { goToBrowserTarget(browserInput); setBrowserInput(""); }}>Go</button>
+                  <a className="icon-button" href={browserUrl} target="_blank" rel="noreferrer" aria-label="Open in new tab" title="Open in a real tab">
+                    <Icon name="external" />
+                  </a>
+                </div>
+                <div className="study-apps">
+                  <span className="study-apps-label">Open logged-in:</span>
+                  {([
+                    ["Gemini", "https://gemini.google.com/app"],
+                    ["ChatGPT", "https://chatgpt.com/"],
+                    ["Claude", "https://claude.ai/new"],
+                    ["Google", "https://www.google.com/"],
+                    ["Docs", "https://docs.google.com/document/u/0/"],
+                  ] as [string, string][]).map(([label, url]) => (
+                    <a key={label} href={url} target="_blank" rel="noreferrer" title={`Open ${label} in a real browser tab`}>{label}</a>
+                  ))}
+                </div>
+                <div className="reader-meta">
+                  <span title={browserUrl}>{hostOf(browserUrl) || "—"}</span>
+                  <div className="reader-modes">
+                    <button className={!liveFrame ? "active" : ""} onClick={() => setLiveFrame(false)}>Reader</button>
+                    <button className={liveFrame ? "active" : ""} onClick={() => setLiveFrame(true)} disabled={isBlockedHost(browserUrl)}>
+                      Live
+                    </button>
+                  </div>
+                </div>
+                <div className="util-view">
+                  {liveFrame && !isBlockedHost(browserUrl) ? (
+                    <iframe
+                      key={`${browserUrl}-${browserNonce}`}
+                      src={browserUrl}
+                      title="In-app browser"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <Suspense fallback={<div className="reader-status">Loading…</div>}>
+                      <WebReader url={browserUrl} nonce={browserNonce} onNavigate={(next) => { setBrowserUrl(next); setBrowserNonce((n) => n + 1); }} />
+                    </Suspense>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {utilTab === "files" && (
+              <div className="util-content">
+                {!activeFile ? (
+                  <>
+                    <div className="util-bar">
+                      <label className="util-go as-label">
+                        Open files…
+                        <input type="file" multiple onChange={(event) => { addLocalFiles(event.target.files); event.target.value = ""; }} hidden />
+                      </label>
+                    </div>
+                    {files.length > 0 && (
+                      <div className="util-links files">
+                        {files.map((file) => (
+                          <button key={file.id} onClick={() => setActiveFileId(file.id)} title={file.name}>
+                            <span>{file.name}</span>
+                            <i onClick={(event) => { event.stopPropagation(); removeLocalFile(file.id); }} aria-hidden="true">×</i>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="util-view">
+                      <div className="util-empty">
+                        <Icon name="doc" />
+                        <p>{files.length ? "Pick a file above to open it." : "Open any local file — PDFs, images, text, audio, or video."}</p>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="file-header">
+                      <button className="icon-button" onClick={() => setActiveFileId(null)} aria-label="Back to files" title="Back to files"><Icon name="back" /></button>
+                      <span className="file-title" title={activeFile.name}>{activeFile.name}</span>
+                      {(activeFile.kind === "pdf" || activeFile.kind === "image" || activeFile.text !== undefined) && (
+                        <div className="pdf-zoom">
+                          <button onClick={() => setFileZoom((z) => Math.max(0.4, Math.round((z - 0.2) * 10) / 10))} aria-label="Zoom out">−</button>
+                          <span>{Math.round(fileZoom * 100)}%</span>
+                          <button onClick={() => setFileZoom((z) => Math.min(4, Math.round((z + 0.2) * 10) / 10))} aria-label="Zoom in">+</button>
+                        </div>
+                      )}
+                      <a className="icon-button" href={activeFile.url} target="_blank" rel="noreferrer" aria-label="Open in new tab" title="Open in a new tab"><Icon name="external" /></a>
+                    </div>
+                    <div className="util-view">
+                      {activeFile.text !== undefined && (
+                        <pre className="file-text" style={{ fontSize: `${0.82 * fileZoom}rem` }}>{activeFile.text}</pre>
+                      )}
+                      {activeFile.text === undefined && activeFile.kind === "image" && (
+                        <div className="file-scroll">
+                          <img className="file-image" src={activeFile.url} alt={activeFile.name} style={{ width: `${fileZoom * 100}%` }} />
+                        </div>
+                      )}
+                      {activeFile.text === undefined && activeFile.kind === "video" && (
+                        <video className="file-media" src={activeFile.url} controls />
+                      )}
+                      {activeFile.text === undefined && activeFile.kind === "audio" && (
+                        <div className="file-audio"><audio src={activeFile.url} controls /></div>
+                      )}
+                      {activeFile.kind === "pdf" && activeFile.data && (
+                        <Suspense fallback={<div className="pdf-status">Loading viewer…</div>}>
+                          <PdfViewer key={activeFile.id} data={activeFile.data} scale={fileZoom} name={activeFile.name} downloadUrl={activeFile.url} />
+                        </Suspense>
+                      )}
+                      {activeFile.text === undefined && activeFile.kind === "other" && (
+                        <div className="util-empty">
+                          <Icon name="doc" />
+                          <p><strong>{activeFile.name}</strong></p>
+                          <p className="util-empty-sub">{activeFile.type || "Unknown type"} — this format has no in-page preview.</p>
+                          <div className="file-actions">
+                            <a className="util-go" href={activeFile.url} target="_blank" rel="noreferrer">Open</a>
+                            <a className="util-go subtle" href={activeFile.url} download={activeFile.name}>Download</a>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {(["x", "y", "xy"] as const).map((axis) => (
+              <div
+                key={axis}
+                className={`util-resize axis-${axis}`}
+                title="Drag to resize"
+                onPointerDown={(event) => {
+                  utilDrag.current = {
+                    axis,
+                    sx: event.clientX,
+                    sy: event.clientY,
+                    ow: utilWidth,
+                    oh: utilHeight ?? (event.currentTarget.parentElement as HTMLElement).offsetHeight,
+                  };
+                  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+                }}
+                onPointerMove={(event) => {
+                  const drag = utilDrag.current;
+                  if (!drag) return;
+                  const patch: { w?: number; h?: number } = {};
+                  if (drag.axis !== "y") patch.w = clamp(drag.ow + (event.clientX - drag.sx), 320, window.innerWidth - 320);
+                  if (drag.axis !== "x") patch.h = clamp(drag.oh + (event.clientY - drag.sy), 240, window.innerHeight - 150);
+                  batchedUtilResize(patch);
+                }}
+                onPointerUp={() => { utilDrag.current = null; }}
+                onPointerCancel={() => { utilDrag.current = null; }}
+              />
+            ))}
+          </section>
+        )}
+
+        <section
+          ref={stageRef}
+          className={`stage stage--${stageArrangement} ${arrangementEditing ? "is-layout-editing" : ""}`}
+          data-arrangement={stageArrangement}
+          aria-label="Pomodoro timer"
+        >
+          {renderStageItem("modes", "mode tabs", (
+            <div className="mode-row" role="tablist" aria-label="Timer mode">
+              {MODE_IDS.map((mode) => (
+                <button
+                  key={mode}
+                  role="tab"
+                  aria-selected={state.mode === mode}
+                  className={`mode-choice ${state.mode === mode ? "active" : ""}`}
+                  onClick={() => switchMode(mode)}
+                >
+                  {modeLabels[mode]}
+                </button>
+              ))}
+            </div>
+          ))}
+
+          {renderStageItem("timer", "timer", (
+            <div
+              className="timer-composition"
+              style={{ "--progress": `${progress * 360}deg`, "--aura": isBreak ? "var(--break)" : "var(--accent)" } as React.CSSProperties}
+            >
+              <div className="timer-aura" aria-hidden="true" />
+              <div className="timer-face">
+                <div className="micro-dots" aria-hidden="true">
+                  {Array.from({ length: cycleLength }).map((_, i) => (
+                    <span key={i} className={dotClass(i)} />
+                  ))}
+                </div>
+                <div className="cycle-copy">{cycleCopy}</div>
+                <TimeReadout seconds={state.remaining} />
+                <div className={`phase-copy ${isBreak ? "break" : ""}`}>{phaseLine}</div>
+              </div>
+            </div>
+          ))}
+
+          {renderStageItem("controls", "timer controls", (
+            <div className="control-row">
+              <button className="round-control" onClick={resetTimer} aria-label="Reset"><Icon name="reset" /></button>
+              <button className="start-control" onClick={running ? pauseTimer : startTimer}>
+                {running ? (
+                  <><Icon name="pause" /> Pause</>
+                ) : (
+                  <><Icon name="play" /> Start</>
+                )}
+              </button>
+              <button className="round-control" onClick={skipSegment} aria-label="Skip"><Icon name="skip" /></button>
+            </div>
+          ))}
+
+          {renderStageItem("task", "task chip", (
+            <button className={`task-chip ${activeTask ? "" : "empty"}`} onClick={() => openPanel("tasks")}>
+              <span aria-hidden="true" />
+              {activeTask ? activeTask.text : "No task selected. Open tasks to pick one."}
+            </button>
+          ))}
+        </section>
+      </div>
+
+      {arrangementEditing && (
+        <div className="layout-editor-bar" role="region" aria-label="Layout editor">
+          <div className="layout-editor-message">
+            <span className="layout-editor-grip" aria-hidden="true">⠿</span>
+            Drag the outlined pieces into place
+          </div>
+          <label className="layout-name-field">
+            <span className="sr-only">Preset name</span>
+            <input
+              aria-label="Preset name"
+              value={arrangementName}
+              onChange={(event) => setArrangementName(event.target.value.slice(0, 32))}
+              onKeyDown={(event) => event.key === "Enter" && saveArrangementPreset()}
+              placeholder="Name this preset"
+              maxLength={32}
+            />
+          </label>
+          <button
+            type="button"
+            className="panel-primary layout-save-button"
+            onClick={saveArrangementPreset}
+            disabled={!arrangementName.trim() || state.customArrangements.length >= 24}
+          >
+            Save preset
+          </button>
+          <button type="button" className="layout-cancel-button" onClick={cancelArrangementEdit}>Cancel</button>
+          {state.customArrangements.length >= 24 && <small className="layout-limit-note">Delete a saved layout to make room.</small>}
+        </div>
+      )}
+
+      <nav className="bottom-dock" aria-label="Tools">
+        {dockItems.map(([id, icon]) => (
+          <button key={id} className={openPanels.includes(id) ? "active" : ""} onClick={() => togglePanel(id)} aria-label={panelMeta[id].title} title={panelMeta[id].title}>
+            <Icon name={icon} />
+          </button>
+        ))}
+        <button onClick={toggleAppFullscreen} aria-label="Toggle fullscreen" title="Fullscreen">
+          <Icon name={isFullscreen ? "unfull" : "full"} />
+        </button>
+      </nav>
+
+      <div className="util-launcher">
+        {utilMenu && (
+          <div className="util-menu" role="menu">
+            {([["youtube", "youtube", "YouTube"], ["web", "globe", "Google / Web"], ["files", "doc", "Documents"]] as [UtilId, string, string][]).map(
+              ([id, icon, label]) => (
+                <button key={id} role="menuitem" className={utilTab === id ? "active" : ""} onClick={() => openUtility(id)}>
+                  <Icon name={icon} />
+                  <span>{label}</span>
+                </button>
+              ),
+            )}
+          </div>
+        )}
+        <button
+          className={`study-toggle ${utilTab ? "active" : ""}`}
+          onClick={() => setUtilMenu((value) => !value)}
+          aria-label="Utilities"
+          aria-expanded={utilMenu}
+          title="Utilities"
+        >
+          <Icon name="grid" />
+        </button>
+      </div>
+
+      {openPanels.map((id, index) => (
+        <FloatingWindow
+          key={id}
+          title={panelMeta[id].title}
+          icon={panelMeta[id].icon}
+          win={state.windows[id] ?? defaultFrame(id === "personal" || id === "notes" || id === "attention")}
+          z={12 + index}
+          onFocus={() => raisePanel(id)}
+          onPatch={(patch) => patchFrame(id, patch)}
+          onClose={() => closePanel(id)}
+        >
+          {panelContent[id]()}
+        </FloatingWindow>
+      ))}
+
+      {confetti.length > 0 && (
+        <div className="confetti" aria-hidden="true">
+          {confetti.map((piece) => (
+            <i
+              key={piece.id}
+              style={{
+                "--x": `${piece.x}vw`,
+                "--dx": `${piece.dx}px`,
+                "--delay": `${piece.delay}s`,
+                "--dur": `${piece.dur}s`,
+                "--size": `${piece.size}px`,
+                "--rot": `${piece.rot}deg`,
+              } as React.CSSProperties}
+            />
+          ))}
+        </div>
+      )}
+
+      {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
+    </main>
+  );
+}
+
+export default App;
