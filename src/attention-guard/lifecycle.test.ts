@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canEmitFocusIntervention, canStartFocusTrackingFromView, isActiveFocusTimer, shouldPauseFocusTimer } from "./lifecycle";
+import { canEmitFocusIntervention, canStartFocusTrackingFromView, isActiveFocusTimer, shouldPauseFocusTimer, shouldPlayAttentionWarning, shouldRunFocusAlarm } from "./lifecycle";
 
 describe("Attention Guard focus lifecycle", () => {
   it("allows focus tracking only while the Focus timer is running", () => {
@@ -30,5 +30,36 @@ describe("Attention Guard focus lifecycle", () => {
     expect(shouldPauseFocusTimer(2, false, true)).toBe(false);
     expect(shouldPauseFocusTimer(2, true, false)).toBe(false);
     expect(shouldPauseFocusTimer(2, true, true)).toBe(true);
+  });
+
+  it("runs the loud alarm only for enabled level-2 off-target warnings in a live Focus run", () => {
+    const focusAlarm = {
+      enabled: true,
+      offTargetAlertsEnabled: true,
+      focusTimerActive: true,
+      status: "on" as const,
+      runPurpose: "focus" as const,
+      warningLevel: 2 as const,
+    };
+    expect(shouldRunFocusAlarm(focusAlarm)).toBe(true);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, warningLevel: 1 })).toBe(false);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, enabled: false })).toBe(false);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, offTargetAlertsEnabled: false })).toBe(false);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, focusTimerActive: false })).toBe(false);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, status: "starting" })).toBe(false);
+    expect(shouldRunFocusAlarm({ ...focusAlarm, runPurpose: "calibration" })).toBe(false);
+  });
+
+  it("preserves phone and screen-break chimes when the loud off-target alarm is enabled", () => {
+    const warning = {
+      soundEnabled: true,
+      focusAlarmEnabled: true,
+      offTargetAlertsEnabled: true,
+      level: 2 as const,
+    };
+    expect(shouldPlayAttentionWarning({ ...warning, reason: "looking-away" })).toBe(false);
+    expect(shouldPlayAttentionWarning({ ...warning, reason: "phone-detected" })).toBe(true);
+    expect(shouldPlayAttentionWarning({ ...warning, reason: "screen-break" })).toBe(true);
+    expect(shouldPlayAttentionWarning({ ...warning, reason: "looking-away", soundEnabled: false })).toBe(false);
   });
 });

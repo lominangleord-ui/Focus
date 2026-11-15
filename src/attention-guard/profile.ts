@@ -40,6 +40,8 @@ export type AttentionProfile = {
   updatedAt: number;
   calibratedAt: number | null;
   calibrationSamples: number;
+  /** 2 denotes a profile fitted with both focused and off-task session labels. */
+  calibrationVersion: number;
   baseline: AttentionBaseline | null;
   zone: AttentionZone;
   zoneShape: "ellipse" | "rectangle";
@@ -88,6 +90,7 @@ export function defaultAttentionProfile(mode: AttentionMode, id = `default-${mod
     updatedAt: now,
     calibratedAt: null,
     calibrationSamples: 0,
+    calibrationVersion: 0,
     baseline: null,
     zone: { ...DEFAULT_ZONE, pitchDeg: mode === "book" ? 22 : DEFAULT_ZONE.pitchDeg, gazeY: mode === "book" ? 1.05 : DEFAULT_ZONE.gazeY },
     zoneShape: "rectangle",
@@ -150,6 +153,7 @@ export function normalizeAttentionProfile(value: unknown): AttentionProfile | nu
     updatedAt: finite(value.updatedAt, Date.now(), 0, 8.64e15),
     calibratedAt: validCalibration ? calibratedAt : null,
     calibrationSamples: validCalibration ? Math.round(finite(value.calibrationSamples, 0, 0, 100_000)) : 0,
+    calibrationVersion: validCalibration ? Math.round(finite(value.calibrationVersion, 0, 0, 99)) : 0,
     baseline: validCalibration ? baseline : null,
     zone: {
       yawDeg: finite(zone.yawDeg, defaults.zone.yawDeg, 5, 60),

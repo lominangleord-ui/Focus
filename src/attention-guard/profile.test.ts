@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { CALIBRATION_TRAINING_VERSION } from "./calibration";
 import { defaultAttentionProfile, normalizeAttentionProfile, parseAttentionProfileFile, serializeAttentionProfile } from "./profile";
 
 const calibrated = () => {
@@ -8,6 +9,7 @@ const calibrated = () => {
     name: "Desk monitor",
     calibratedAt: 120,
     calibrationSamples: 30,
+    calibrationVersion: CALIBRATION_TRAINING_VERSION,
     baseline: { yawDeg: 2, pitchDeg: -3, rollDeg: 0, gazeX: 0.1, gazeY: -0.2 },
   };
 };
@@ -17,7 +19,7 @@ describe("Attention Guard profile files", () => {
     const text = serializeAttentionProfile(calibrated(), "2026-11-05T12:00:00.000Z");
     const file = JSON.parse(text) as { format: string; schemaVersion: number; exportedAt: string; profile: { name: string } };
     expect(file).toMatchObject({ format: "focus-draft-attention-profile", schemaVersion: 1, profile: { name: "Desk monitor" } });
-    expect(parseAttentionProfileFile(text)).toMatchObject({ id: "desk", calibratedAt: 120, calibrationSamples: 30 });
+    expect(parseAttentionProfileFile(text)).toMatchObject({ id: "desk", calibratedAt: 120, calibrationSamples: 30, calibrationVersion: CALIBRATION_TRAINING_VERSION });
     expect(text).not.toContain("statsByDay");
   });
 
@@ -32,8 +34,10 @@ describe("Attention Guard profile files", () => {
     delete legacy.zoneShape;
     delete legacy.marginPercent;
     delete legacy.negativeOverlap;
+    delete legacy.calibrationVersion;
     const result = normalizeAttentionProfile(legacy);
     expect(result).toMatchObject({
+      calibrationVersion: 0,
       zoneShape: "rectangle",
       marginPercent: 20,
       negativeOverlap: null,

@@ -3,6 +3,8 @@ import { createScreenBreakMemory, updateScreenBreakReminder, type ScreenBreakMem
 import { isCameraSelectionConfirmedMissing } from "./deviceSelection";
 import { ATTENTION_SAMPLE_STALE_MS, isAttentionSampleStale } from "./freshness";
 import { canEmitFocusIntervention } from "./lifecycle";
+import { CALIBRATION_TRAINING_VERSION } from "./calibration";
+import { createPhoneAlertMemory, updatePhoneAlert, type PhoneAlertMemory } from "./phoneDetection";
 import type { AttentionProfile } from "./profile";
 import type { AttentionClassification, AttentionIntervention, AttentionWorkerResponse, CameraDevice, GuardRunPurpose, GuardRuntimeState, RawAttentionSignals } from "./types";
 
@@ -21,6 +23,8 @@ const OFF_STATE: GuardRuntimeState = {
   activeDeviceId: "",
   runPurpose: null,
   startupStage: null,
+  phoneDetectionStatus: "off",
+  phoneDetectionError: "",
 };
 
 function isEmbeddedDocument() {
@@ -31,35 +35,48 @@ function isEmbeddedDocument() {
   }
 }
 
+function errorName(error: unknown) {
+  if (error == null || typeof error !== "object" || !("name" in error)) return "";
+  return typeof error.name === "string" ? error.name : "";
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error == null || typeof error !== "object" || !("message" in error)) return "";
+  return typeof error.message === "string" ? error.message : "";
+}
+
 function isCameraConstraintError(error: unknown) {
-  const name = error instanceof Error ? error.name : "";
+  const name = errorName(error);
   return name === "OverconstrainedError" || name === "NotFoundError" || name === "DevicesNotFoundError";
 }
 
 function cameraErrorMessage(error: unknown) {
-  if (!(error instanceof DOMException)) return error instanceof Error ? error.message : "Camera could not be started.";
-  if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+  const name = errorName(error);
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
     const embeddedHint = isEmbeddedDocument() ? " This app is embedded; open its Vercel URL directly or allow camera access in the parent page too." : "";
     return `Camera permission was denied or blocked by browser/site settings. Allow camera for this site using the address-bar permission icon, then retry.${embeddedHint}`;
   }
-  if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
     return "No camera was found. Connect a camera and try again.";
   }
-  if (error.name === "NotReadableError" || error.name === "TrackStartError") {
+  if (name === "NotReadableError" || name === "TrackStartError") {
     return "The camera is busy in another app or could not be read. Close other camera apps and try again.";
   }
-  if (error.name === "OverconstrainedError" || error.name === "ConstraintNotSatisfiedError") {
+  if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
     return "That camera does not support the requested video size. Choose another camera.";
   }
-  if (error.name === "SecurityError") {
+  if (name === "SecurityError") {
     return "Camera access requires a secure page (HTTPS or localhost).";
   }
-  return error.message || "Camera could not be started.";
+  return errorMessage(error) || "Camera could not be started.";
 }
+
+const DEVELOPMENT_WORKER_PATH = "/src/attention-guard/worker.ts";
 
 function createWorker() {
   const workerUrl = import.meta.env.DEV
-    ? new URL("/src/attention-guard/worker.ts", window.location.href)
+    ? new URL(DEVELOPMENT_WORKER_PATH, window.location.href)
     : new URL("attention-guard/worker.js", new URL(import.meta.env.BASE_URL, document.baseURI));
   return new Worker(workerUrl, {
     type: "module",
@@ -79,21 +96,33 @@ const CAMERA_DEPLOYMENT_FILES = [
 ] as const;
 
 async function verifyCameraDeploymentFiles() {
-  const deploymentHint = 'Vercel must run "npm run build" and publish "dist".';
-  await Promise.all(CAMERA_DEPLOYMENT_FILES.map(async (path) => {
+  const setupHint = import.meta.env.DEV
+    ? "Check that the Vite dev server and local camera assets are available."
+    : 'Vercel must run "npm run build" and publish "dist".';
+  const files = import.meta.env.DEV
+    ? [
+      { path: DEVELOPMENT_WORKER_PATH, url: new URL(DEVELOPMENT_WORKER_PATH, window.location.href).href },
+      ...CAMERA_DEPLOYMENT_FILES
+        .filter((path) => path !== "attention-guard/worker.js")
+        .map((path) => ({ path, url: assetUrl(path) })),
+    ]
+    : CAMERA_DEPLOYMENT_FILES.map((path) => ({ path, url: assetUrl(path) }));
+
+  await Promise.all(files.map(async ({ path, url }) => {
     let response: Response;
     try {
-      response = await fetch(assetUrl(path), { method: "HEAD", cache: "no-store" });
+      response = await fetch(url, { method: "HEAD", cache: "no-store" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Network request failed.";
-      throw new Error(`Could not verify camera file "${path}". Check network access and deployment settings. ${deploymentHint} (${detail})`);
+      throw new Error(`Could not verify camera file "${path}". Check network access and settings. ${setupHint} (${detail})`);
     }
     if (!response.ok) {
-      throw new Error(`Camera file "${path}" returned HTTP ${response.status}. ${deploymentHint}`);
+      throw new Error(`Camera file "${path}" returned HTTP ${response.status}. ${setupHint}`);
     }
     const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    if (contentType.includes("text/html") || (path.endsWith(".js") && !/javascript|ecmascript/.test(contentType))) {
-      throw new Error(`Camera file "${path}" is being served with an invalid content type (${contentType || "missing"}). ${deploymentHint}`);
+    const isScript = path.endsWith(".js") || path.endsWith(".ts");
+    if (contentType.includes("text/html") || (isScript && !/javascript|ecmascript/.test(contentType))) {
+      throw new Error(`Camera file "${path}" is being served with an invalid content type (${contentType || "missing"}). ${setupHint}`);
     }
   }));
 }
@@ -129,6 +158,8 @@ export class AttentionGuardController {
   private lastVideoTime = -1;
   private mounted = false;
   private focusTimerActive = false;
+  private phoneDetectionEnabled = false;
+  private phoneAlertMemory: PhoneAlertMemory = createPhoneAlertMemory();
 
   readonly getState = () => this.runtime;
   readonly getSignals = () => this.signals;
@@ -211,6 +242,18 @@ export class AttentionGuardController {
     this.updateClassification(this.signals);
   }
 
+  setPhoneDetectionEnabled(enabled: boolean) {
+    if (enabled === this.phoneDetectionEnabled) return;
+    this.phoneDetectionEnabled = enabled;
+    this.resetPhoneAlarm();
+    const focusRun = this.runtime.runPurpose === "focus" && (this.runtime.status === "starting" || this.runtime.status === "on");
+    this.updateState({
+      phoneDetectionStatus: focusRun && enabled ? "loading" : "off",
+      phoneDetectionError: "",
+    });
+    if (focusRun && this.worker) this.worker.postMessage({ type: "phone-detection", enabled });
+  }
+
   setProfile(profile: AttentionProfile) {
     const key = JSON.stringify(profile);
     if (this.profileKey === key) return;
@@ -248,6 +291,23 @@ export class AttentionGuardController {
         activeDeviceId: "",
         runPurpose: null,
         startupStage: null,
+        phoneDetectionStatus: "off",
+        phoneDetectionError: "",
+      });
+      return;
+    }
+    if (this.profile.calibrationVersion < CALIBRATION_TRAINING_VERSION) {
+      this.generation += 1;
+      this.stopResources();
+      this.setSignals(null);
+      this.updateState({
+        status: "error",
+        error: "Recalibrate this profile with focused and intentional off-task captures before starting Focus tracking.",
+        activeDeviceId: "",
+        runPurpose: null,
+        startupStage: null,
+        phoneDetectionStatus: "off",
+        phoneDetectionError: "",
       });
       return;
     }
@@ -275,6 +335,8 @@ export class AttentionGuardController {
       activeDeviceId: "",
       runPurpose,
       startupStage: "requesting-permission",
+      phoneDetectionStatus: runPurpose === "focus" && this.phoneDetectionEnabled ? "loading" : "off",
+      phoneDetectionError: "",
     });
 
     if (!window.isSecureContext) {
@@ -291,12 +353,12 @@ export class AttentionGuardController {
 
     try {
       const videoConstraints: MediaTrackConstraints = {
-        width: { ideal: 640, max: 1280 },
-        height: { ideal: 480, max: 720 },
-        frameRate: { ideal: 12, max: 20 },
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        frameRate: { ideal: 12 },
       };
       if (deviceId) videoConstraints.deviceId = { exact: deviceId };
-      else videoConstraints.facingMode = "user";
+      else videoConstraints.facingMode = { ideal: "user" };
       // Invoke getUserMedia immediately in the click stack so browsers can show
       // their permission UI before any deployment or model checks run.
       const permissionRequest = navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
@@ -310,10 +372,10 @@ export class AttentionGuardController {
         // Device IDs are origin-specific and can go stale when moving between
         // Vercel preview/production URLs. Retry the user's default camera when
         // an exact ID or strict constraint prevents the browser from prompting.
-        const canRetryDefault = isCameraConstraintError(error) && (Boolean(deviceId) || (error instanceof Error && error.name === "OverconstrainedError"));
+        const canRetryDefault = isCameraConstraintError(error) && (Boolean(deviceId) || errorName(error) === "OverconstrainedError");
         if (!canRetryDefault || run !== this.generation) throw error;
         this.updateState({ startupStage: "retrying-default-camera" });
-        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: "user" } });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "user" } } });
       }
       if (this.permissionTimer != null) window.clearTimeout(this.permissionTimer);
       this.permissionTimer = null;
@@ -355,6 +417,9 @@ export class AttentionGuardController {
         type: "init",
         modelUrl: assetUrl("attention-guard/face_landmarker.task"),
         wasmBaseUrl: assetUrl("attention-guard/wasm").replace(/\/$/, ""),
+        phoneDetectorModelUrl: assetUrl("attention-guard/phone-detector/model.json"),
+        phoneDetectorWasmBaseUrl: `${assetUrl("attention-guard/phone-detector/wasm").replace(/\/$/, "")}/`,
+        phoneDetectionEnabled: runPurpose === "focus" && this.phoneDetectionEnabled,
       });
       this.initTimer = window.setTimeout(() => {
         this.fail(run, new Error("The local face model took too long to load. Check that the app is fully downloaded and refresh."));
@@ -368,7 +433,15 @@ export class AttentionGuardController {
     this.generation += 1;
     this.stopResources();
     this.setSignals(null);
-    this.updateState({ status: "off", error: "", activeDeviceId: "", runPurpose: null, startupStage: null });
+    this.updateState({
+      status: "off",
+      error: "",
+      activeDeviceId: "",
+      runPurpose: null,
+      startupStage: null,
+      phoneDetectionStatus: "off",
+      phoneDetectionError: "",
+    });
   }
 
   private readonly onVisibilityChange = () => {
@@ -376,7 +449,14 @@ export class AttentionGuardController {
       this.generation += 1;
       this.stopResources();
       this.setSignals(null);
-      this.updateState({ status: "paused", error: "Tracking paused because this tab went into the background. Turn it on again when you return.", activeDeviceId: "", startupStage: null });
+      this.updateState({
+        status: "paused",
+        error: "Tracking paused because this tab went into the background. Turn it on again when you return.",
+        activeDeviceId: "",
+        startupStage: null,
+        phoneDetectionStatus: "off",
+        phoneDetectionError: "",
+      });
     }
   };
 
@@ -393,6 +473,18 @@ export class AttentionGuardController {
 
   private onWorkerMessage(run: number, message: AttentionWorkerResponse) {
     if (run !== this.generation) return;
+    if (message.type === "phone-detection-state") {
+      if (message.status === "error") this.resetPhoneAlarm();
+      this.updateState({
+        phoneDetectionStatus: message.status,
+        phoneDetectionError: message.message ?? "",
+      });
+      return;
+    }
+    if (message.type === "phone-detection-result") {
+      this.handlePhoneDetectionResult(message.detectedAt, message.confidence);
+      return;
+    }
     if (message.type === "ready") {
       if (this.initTimer != null) window.clearTimeout(this.initTimer);
       this.initTimer = null;
@@ -418,6 +510,20 @@ export class AttentionGuardController {
       return;
     }
     this.fail(run, new Error(message.message));
+  }
+
+  private handlePhoneDetectionResult(detectedAt: number, confidence: number) {
+    if (!this.phoneDetectionEnabled || this.runtime.phoneDetectionStatus !== "ready") return;
+    const update = updatePhoneAlert(this.phoneAlertMemory, detectedAt, confidence);
+    this.phoneAlertMemory = update.memory;
+    if (!update.shouldAlert || !canEmitFocusIntervention(this.focusTimerActive, this.runtime.status, this.runtime.runPurpose)) return;
+    const intervention: AttentionIntervention = {
+      level: 2,
+      score: confidence,
+      reason: "phone-detected",
+      triggeredAt: detectedAt,
+    };
+    this.interventionListeners.forEach((listener) => listener(intervention));
   }
 
   private scheduleCapture(run: number) {
@@ -480,7 +586,15 @@ export class AttentionGuardController {
     this.generation += 1;
     this.stopResources();
     this.setSignals(null);
-    this.updateState({ status: "error", error: message, activeDeviceId: "", runPurpose: null, startupStage: null });
+    this.updateState({
+      status: "error",
+      error: message,
+      activeDeviceId: "",
+      runPurpose: null,
+      startupStage: null,
+      phoneDetectionStatus: "off",
+      phoneDetectionError: "",
+    });
   }
 
   private stopResources() {
@@ -497,6 +611,7 @@ export class AttentionGuardController {
     this.consecutiveCaptureFailures = 0;
     this.lastSampleReceivedAt = null;
     this.screenBreakMemory = createScreenBreakMemory();
+    this.resetPhoneAlarm();
     this.pendingFrameId = null;
     this.lastVideoTime = -1;
 
@@ -572,6 +687,10 @@ export class AttentionGuardController {
       };
       this.interventionListeners.forEach((listener) => listener(intervention));
     }
+  }
+
+  private resetPhoneAlarm() {
+    this.phoneAlertMemory = createPhoneAlertMemory();
   }
 
   private updateState(patch: Partial<GuardRuntimeState>) {

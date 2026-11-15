@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AttentionGuardController } from "./controller";
+import { CALIBRATION_TRAINING_VERSION } from "./calibration";
 import { createAttentionProfile } from "./profile";
 import type { AttentionWorkerRequest, AttentionWorkerResponse, RawAttentionSignals } from "./types";
 
@@ -55,11 +56,11 @@ function installCameraMocks(videoReadyState: number) {
     baseURI: "https://focus.example.test/",
     createElement: () => video,
   });
-  const getUserMedia = vi.fn(async () => stream);
+  const getUserMedia = vi.fn(async (_constraints: MediaStreamConstraints) => stream);
   vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(null, {
     status: 200,
-    headers: { "content-type": String(input).endsWith(".js") ? "text/javascript; charset=utf-8" : "application/octet-stream" },
+    headers: { "content-type": /\.(?:js|ts)$/.test(String(input)) ? "text/javascript; charset=utf-8" : "application/octet-stream" },
   })));
   vi.stubGlobal("HTMLMediaElement", { HAVE_CURRENT_DATA: 2 });
   vi.stubGlobal("Worker", FakeWorker);
@@ -97,11 +98,27 @@ describe("Attention Guard controller lifecycle gate", () => {
     expect(FakeWorker.instances).toHaveLength(0);
   });
 
+  it("requires older saved profiles to be recalibrated with both labeled phases", async () => {
+    const controller = new AttentionGuardController();
+    const profile = createAttentionProfile("screen", "Legacy desk", "legacy-desk", 1);
+    profile.calibratedAt = 2;
+    profile.baseline = { yawDeg: 0, pitchDeg: 0, rollDeg: 0, gazeX: 0, gazeY: 0 };
+    controller.setProfile(profile);
+    controller.setFocusTimerActive(true);
+
+    await controller.start();
+
+    expect(controller.getState()).toMatchObject({ status: "error", runPurpose: null });
+    expect(controller.getState().error).toContain("Recalibrate this profile");
+    expect(FakeWorker.instances).toHaveLength(0);
+  });
+
   it("allows Focus tracking with a calibrated profile during an active Focus timer", async () => {
     installCameraMocks(2);
     const controller = new AttentionGuardController();
     const profile = createAttentionProfile("screen", "Desk", "desk", 1);
     profile.calibratedAt = 2;
+    profile.calibrationVersion = CALIBRATION_TRAINING_VERSION;
     profile.baseline = { yawDeg: 0, pitchDeg: 0, rollDeg: 0, gazeX: 0, gazeY: 0 };
     controller.setProfile(profile);
     controller.setFocusTimerActive(true);
@@ -113,7 +130,81 @@ describe("Attention Guard controller lifecycle gate", () => {
     controller.stop();
   });
 
-  it("shows real camera startup stages and waits for the published worker and model assets", async () => {
+  it("loads the optional phone detector only in Focus and alerts after repeated phone hits", async () => {
+    installCameraMocks(2);
+    const controller = new AttentionGuardController();
+    const profile = createAttentionProfile("screen", "Desk", "desk", 1);
+    profile.calibratedAt = 2;
+    profile.calibrationVersion = CALIBRATION_TRAINING_VERSION;
+    profile.baseline = { yawDeg: 0, pitchDeg: 0, rollDeg: 0, gazeX: 0, gazeY: 0 };
+    controller.setProfile(profile);
+    controller.setFocusTimerActive(true);
+    controller.setPhoneDetectionEnabled(true);
+    const interventionListener = vi.fn();
+    controller.subscribeInterventions(interventionListener);
+
+    await controller.start();
+
+    const worker = FakeWorker.instances[0];
+    const init = worker.messages.find((message) => message.type === "init");
+    expect(init).toMatchObject({
+      type: "init",
+      phoneDetectionEnabled: true,
+      phoneDetectorModelUrl: "https://focus.example.test/attention-guard/phone-detector/model.json",
+      phoneDetectorWasmBaseUrl: "https://focus.example.test/attention-guard/phone-detector/wasm/",
+    });
+    expect(fetch).toHaveBeenCalledTimes(4);
+    worker.onmessage?.({ data: { type: "ready" } } as MessageEvent<AttentionWorkerResponse>);
+    worker.onmessage?.({ data: { type: "phone-detection-state", status: "ready" } } as MessageEvent<AttentionWorkerResponse>);
+    expect(controller.getState()).toMatchObject({ status: "on", runPurpose: "focus", phoneDetectionStatus: "ready" });
+
+    worker.onmessage?.({ data: { type: "phone-detection-result", detectedAt: 1_000, confidence: 0.8 } } as MessageEvent<AttentionWorkerResponse>);
+    expect(interventionListener).not.toHaveBeenCalled();
+    worker.onmessage?.({ data: { type: "phone-detection-result", detectedAt: 2_000, confidence: 0.78 } } as MessageEvent<AttentionWorkerResponse>);
+    expect(interventionListener).toHaveBeenCalledTimes(1);
+    expect(interventionListener).toHaveBeenCalledWith(expect.objectContaining({ reason: "phone-detected", level: 2, triggeredAt: 2_000 }));
+
+    controller.setPhoneDetectionEnabled(false);
+    expect(worker.messages.at(-1)).toEqual({ type: "phone-detection", enabled: false });
+    expect(controller.getState().phoneDetectionStatus).toBe("off");
+    worker.onmessage?.({ data: { type: "phone-detection-result", detectedAt: 3_000, confidence: 0.99 } } as MessageEvent<AttentionWorkerResponse>);
+    expect(interventionListener).toHaveBeenCalledTimes(1);
+    controller.stop();
+  });
+
+  it("allows the explicit calibration camera without starting or requiring a Focus timer", async () => {
+    const mocks = installCameraMocks(2);
+    const controller = new AttentionGuardController();
+    controller.setPhoneDetectionEnabled(true);
+
+    await controller.startCalibration();
+
+    expect(controller.getState()).toMatchObject({ status: "starting", runPurpose: "calibration", startupStage: "loading-model", phoneDetectionStatus: "off" });
+    expect(mocks.getUserMedia).toHaveBeenCalledTimes(1);
+    const init = FakeWorker.instances[0].messages.find((message) => message.type === "init");
+    expect(init).toMatchObject({ type: "init", phoneDetectionEnabled: false });
+    expect(fetch).toHaveBeenCalledTimes(4);
+    controller.stop();
+  });
+
+  it("keeps facing mode and video size as preferences so ordinary webcams still prompt", async () => {
+    const mocks = installCameraMocks(2);
+    const controller = new AttentionGuardController();
+
+    await controller.startDiagnostic();
+
+    const constraints = mocks.getUserMedia.mock.calls[0]?.[0];
+    expect(mocks.getUserMedia).toHaveBeenCalledTimes(1);
+    expect(constraints?.video).toMatchObject({
+      facingMode: { ideal: "user" },
+      width: { ideal: 640 },
+      height: { ideal: 480 },
+      frameRate: { ideal: 12 },
+    });
+    controller.stop();
+  });
+
+  it("verifies the correct face-worker route for this build before loading the model", async () => {
     installCameraMocks(2);
     const controller = new AttentionGuardController();
 
@@ -122,6 +213,13 @@ describe("Attention Guard controller lifecycle gate", () => {
     await startup;
     expect(controller.getState()).toMatchObject({ status: "starting", startupStage: "loading-model" });
     expect(fetch).toHaveBeenCalledTimes(4);
+    const expectedWorkerUrl = import.meta.env.DEV
+      ? "https://focus.example.test/src/attention-guard/worker.ts"
+      : "https://focus.example.test/attention-guard/worker.js";
+    expect(fetch).toHaveBeenCalledWith(expectedWorkerUrl, { method: "HEAD", cache: "no-store" });
+    if (import.meta.env.DEV) {
+      expect(fetch).not.toHaveBeenCalledWith("https://focus.example.test/attention-guard/worker.js", expect.anything());
+    }
 
     const worker = FakeWorker.instances[0];
     worker.onmessage?.({ data: { type: "ready" } } as MessageEvent<AttentionWorkerResponse>);
@@ -141,7 +239,7 @@ describe("Attention Guard controller lifecycle gate", () => {
 
     expect(getUserMedia).toHaveBeenCalledTimes(2);
     expect(getUserMedia.mock.calls[0]?.[0]).toMatchObject({ video: { deviceId: { exact: "stale-camera-id" } } });
-    expect(getUserMedia.mock.calls[1]?.[0]).toMatchObject({ video: { facingMode: "user" } });
+    expect(getUserMedia.mock.calls[1]?.[0]).toMatchObject({ video: { facingMode: { ideal: "user" } } });
     expect(controller.getState()).toMatchObject({ status: "starting", startupStage: "loading-model", selectedDeviceId: "mock-camera" });
     expect(FakeWorker.instances).toHaveLength(1);
     controller.stop();
@@ -168,15 +266,19 @@ describe("Attention Guard controller lifecycle gate", () => {
     expect(mocks.track.stop).toHaveBeenCalled();
   });
 
-  it("explains when Vercel is missing the deployed camera worker or model assets", async () => {
+  it("explains when the face model asset is missing from the current build", async () => {
     const mocks = installCameraMocks(2);
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(null, {
+      status: String(input).endsWith("/face_landmarker.task") ? 404 : 200,
+      headers: { "content-type": /\.(?:js|ts)$/.test(String(input)) ? "text/javascript; charset=utf-8" : "application/octet-stream" },
+    })));
     const controller = new AttentionGuardController();
 
     await controller.startDiagnostic();
 
     expect(controller.getState()).toMatchObject({ status: "error", startupStage: null });
-    expect(controller.getState().error).toContain('Vercel must run "npm run build" and publish "dist"');
+    expect(controller.getState().error).toContain('Camera file "attention-guard/face_landmarker.task" returned HTTP 404');
+    expect(controller.getState().error).toContain(import.meta.env.DEV ? "Vite dev server" : 'Vercel must run "npm run build"');
     expect(FakeWorker.instances).toHaveLength(0);
     expect(mocks.track.stop).toHaveBeenCalled();
   });

@@ -14,7 +14,12 @@ export type CalibrationTarget = {
 };
 
 export type CalibrationSamples = Record<string, RawAttentionSignals[]>;
+export type CalibrationSessionPhase = "focused" | "offTask";
+export type CalibrationSessionSamples = Record<CalibrationSessionPhase, RawAttentionSignals[]>;
 export type CalibrationSignalKey = keyof AttentionBaseline;
+
+export const CALIBRATION_SESSION_MIN_SAMPLES = 20;
+export const CALIBRATION_TRAINING_VERSION = 2;
 
 export type CalibrationTargetDiagnostic = {
   id: string;
@@ -35,6 +40,9 @@ export type CalibrationResult = {
   negativeOverlap: number | null;
   positiveOutside: number;
   targetDiagnostics: CalibrationTargetDiagnostic[];
+  /** Session calibration fits these weights and thresholds from both labeled phases. */
+  tuning?: AttentionClassifierTuning;
+  balancedAccuracy?: number;
   warnings: string[];
 };
 
@@ -98,6 +106,16 @@ function median(values: number[]): number {
 
 function medianAbsoluteDeviation(values: number[], center = median(values)) {
   return median(values.map((value) => Math.abs(value - center)));
+}
+
+function quantile(values: number[], fraction: number) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const position = Math.max(0, Math.min(1, fraction)) * (sorted.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const blend = position - lower;
+  return sorted[lower] * (1 - blend) + sorted[upper] * blend;
 }
 
 function finiteSignalValues(samples: RawAttentionSignals[], key: CalibrationSignalKey) {
@@ -247,6 +265,185 @@ export function calculateCalibration(
     negativeOverlap,
     positiveOutside,
     targetDiagnostics: diagnostics,
+    warnings,
+  };
+}
+
+function makePhaseDiagnostic(
+  id: string,
+  label: string,
+  kind: CalibrationTarget["kind"],
+  samples: RawAttentionSignals[],
+  baseline: AttentionBaseline,
+): CalibrationTargetDiagnostic {
+  const summary = Object.fromEntries(SIGNAL_KEYS.map((key) => [key, targetSummary(samples, key).center])) as AttentionBaseline;
+  return {
+    id,
+    label,
+    kind,
+    yawDelta: summary.yawDeg - baseline.yawDeg,
+    pitchDelta: summary.pitchDeg - baseline.pitchDeg,
+    gazeXDelta: summary.gazeX - baseline.gazeX,
+    gazeYDelta: summary.gazeY - baseline.gazeY,
+  };
+}
+
+type SessionThresholdFit = {
+  threshold: number;
+  tuning: AttentionClassifierTuning;
+  positiveOutside: number;
+  negativeOverlap: number;
+  balancedAccuracy: number;
+  utility: number;
+};
+
+function fitSessionThreshold(
+  positiveScores: number[],
+  negativeScores: number[],
+  currentThreshold: number,
+): Omit<SessionThresholdFit, "tuning"> | null {
+  if (!positiveScores.length || !negativeScores.length) return null;
+  const values = [...positiveScores, ...negativeScores].filter(Number.isFinite).sort((a, b) => a - b);
+  const candidates = new Set<number>([clamp(currentThreshold, 0.2, 2.5)]);
+  for (const value of values) candidates.add(clamp(value, 0.2, 2.5));
+  for (let index = 1; index < values.length; index += 1) {
+    candidates.add(clamp((values[index - 1] + values[index]) / 2, 0.2, 2.5));
+  }
+
+  let best: Omit<SessionThresholdFit, "tuning"> | null = null;
+  for (const threshold of candidates) {
+    const positiveOutside = positiveScores.filter((score) => score >= threshold).length / positiveScores.length;
+    const offTaskRecall = negativeScores.filter((score) => score >= threshold).length / negativeScores.length;
+    const negativeOverlap = 1 - offTaskRecall;
+    const balancedAccuracy = ((1 - positiveOutside) + offTaskRecall) / 2;
+    // Slightly prioritize catching the labeled off-task looks, while penalizing
+    // boundaries that would classify too much normal work as distracted.
+    const utility = 0.62 * offTaskRecall + 0.38 * (1 - positiveOutside) - Math.max(0, positiveOutside - 0.15) * 1.25;
+    const candidate = { threshold, positiveOutside, negativeOverlap, balancedAccuracy, utility };
+    if (!best
+      || candidate.utility > best.utility + 1e-9
+      || (Math.abs(candidate.utility - best.utility) <= 1e-9 && candidate.positiveOutside < best.positiveOutside)
+      || (Math.abs(candidate.utility - best.utility) <= 1e-9 && candidate.positiveOutside === best.positiveOutside && Math.abs(candidate.threshold - currentThreshold) < Math.abs(best.threshold - currentThreshold))) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/** Uses both labeled captures to fit the pose/gaze weighting and warning
+ * boundary. Only compact model parameters and aggregate diagnostics are saved. */
+function fitSessionTuning(
+  mode: AttentionMode,
+  baseline: AttentionBaseline,
+  zone: AttentionZone,
+  zoneShape: AttentionProfile["zoneShape"],
+  focusedSamples: RawAttentionSignals[],
+  offTaskSamples: RawAttentionSignals[],
+  tuning: AttentionClassifierTuning,
+): SessionThresholdFit | null {
+  const poseWeights = [...new Set([0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1, tuning.poseWeight])];
+  let best: SessionThresholdFit | null = null;
+  for (const poseWeight of poseWeights) {
+    const candidateTuning = { ...tuning, poseWeight, gazeWeight: 1 - poseWeight };
+    const scoringProfile = createScoringProfile(mode, baseline, zone, zoneShape, candidateTuning);
+    const positiveScores = focusedSamples.map((sample) => computeAttentionScore(sample, scoringProfile) ?? Number.POSITIVE_INFINITY);
+    const negativeScores = offTaskSamples.map((sample) => computeAttentionScore(sample, scoringProfile) ?? Number.POSITIVE_INFINITY);
+    const fit = fitSessionThreshold(positiveScores, negativeScores, tuning.level1Score);
+    if (!fit) continue;
+    const level2Score = clamp(Math.max(fit.threshold + 0.15, quantile(negativeScores, 0.75)), fit.threshold + 0.15, 4);
+    const result: SessionThresholdFit = {
+      ...fit,
+      tuning: { ...candidateTuning, level1Score: fit.threshold, level2Score },
+    };
+    if (!best
+      || result.utility > best.utility + 1e-9
+      || (Math.abs(result.utility - best.utility) <= 1e-9 && result.positiveOutside < best.positiveOutside)
+      || (Math.abs(result.utility - best.utility) <= 1e-9 && result.positiveOutside === best.positiveOutside && Math.abs(poseWeight - tuning.poseWeight) < Math.abs(best.tuning.poseWeight - tuning.poseWeight))) {
+      best = result;
+    }
+  }
+  return best;
+}
+
+/** Fits a work-area zone and decision boundary from longer natural-viewing
+ * phases labeled as focused or intentionally off-task. The local camera model
+ * is not updated; this fits compact per-profile scoring parameters from the
+ * user's numeric samples. Raw frames and samples are never stored. */
+export function calculateSessionCalibration(
+  mode: AttentionMode,
+  session: CalibrationSessionSamples,
+  marginPercent: number,
+  zoneShape: AttentionProfile["zoneShape"],
+  tuning: AttentionClassifierTuning = defaultAttentionProfile(mode).tuning,
+): CalibrationResult | null {
+  const qualityProfile = { ...defaultAttentionProfile(mode), tuning };
+  const focusedSamples = session.focused.filter((sample) => isCalibrationSignalValid(sample, qualityProfile));
+  const offTaskSamples = session.offTask.filter((sample) => isCalibrationSignalValid(sample, qualityProfile));
+  if (focusedSamples.length < CALIBRATION_SESSION_MIN_SAMPLES || offTaskSamples.length < CALIBRATION_SESSION_MIN_SAMPLES) return null;
+
+  const baseline = medianCalibrationBaseline(focusedSamples);
+  if (!baseline) return null;
+
+  const safeMargin = clamp(Number.isFinite(marginPercent) ? marginPercent : 20, 0, 80);
+  const zone = {} as AttentionZone;
+  for (const key of SIGNAL_KEYS) {
+    const deviations = focusedSamples.map((sample) => Math.abs(sample[key]! - baseline[key]));
+    const robustSpread = targetSummary(focusedSamples, key).spread * 2.5;
+    zone[key] = clamp(
+      Math.max(MIN_ZONE[key], NOISE_FLOOR[key], quantile(deviations, 0.9), robustSpread),
+      MIN_ZONE[key],
+      MAX_ZONE[key],
+    );
+  }
+
+  for (const key of SIGNAL_KEYS) {
+    zone[key] = clamp(zone[key] * (1 + safeMargin / 100), MIN_ZONE[key], MAX_ZONE[key]);
+  }
+
+  const fit = fitSessionTuning(mode, baseline, zone, zoneShape, focusedSamples, offTaskSamples, tuning);
+  const trainedTuning = fit?.tuning ?? tuning;
+  const scoreProfile = createScoringProfile(mode, baseline, zone, zoneShape, trainedTuning);
+  const positiveOutside = fit?.positiveOutside
+    ?? focusedSamples.filter((sample) => (computeAttentionScore(sample, scoreProfile) ?? Number.POSITIVE_INFINITY) >= trainedTuning.level1Score).length / focusedSamples.length;
+  const negativeOverlap = fit?.negativeOverlap
+    ?? offTaskSamples.filter((sample) => (computeAttentionScore(sample, scoreProfile) ?? Number.POSITIVE_INFINITY) < trainedTuning.level1Score).length / offTaskSamples.length;
+  const balancedAccuracy = fit?.balancedAccuracy ?? 0;
+  const diagnostics = [
+    makePhaseDiagnostic("focused", "Normal work or reading", "positive", focusedSamples, baseline),
+    makePhaseDiagnostic("off-task", "Intentional off-task looks", "negative", offTaskSamples, baseline),
+  ];
+  const warnings: string[] = [];
+
+  if (negativeOverlap >= 0.15) {
+    warnings.push(`${Math.round(negativeOverlap * 100)}% of intentional off-task samples still scored as focused. Capture varied off-task looks that match your real distractions, then verify in Test Lab.`);
+  } else if (negativeOverlap > 0.03) {
+    warnings.push(`${Math.round(negativeOverlap * 100)}% of off-task samples still scored as focused. Verify the boundary in Test Lab before relying on reminders.`);
+  }
+  if (positiveOutside >= 0.2) {
+    warnings.push(`${Math.round(positiveOutside * 100)}% of normal work or reading samples scored as off-task. Add another focused capture or increase the margin.`);
+  }
+  if (balancedAccuracy < 0.68) {
+    warnings.push("The focused and off-task captures overlap strongly in the available webcam signals. Webcam direction cannot determine what task you are doing; use the optional phone alarm for visible phones and keep reminders conservative.");
+  }
+  if (SIGNAL_KEYS.some((key) => zone[key] >= MAX_ZONE[key] - 1e-9)) {
+    warnings.push("At least one calibrated range reached its safety limit. The available webcam signals may not distinguish this work area reliably; verify it in Test Lab.");
+  }
+  const offTaskDiagnostic = diagnostics[1];
+  if (Math.hypot(offTaskDiagnostic.yawDelta / 6, offTaskDiagnostic.pitchDelta / 6, offTaskDiagnostic.gazeXDelta / 0.18, offTaskDiagnostic.gazeYDelta / 0.18) < 0.18) {
+    warnings.push("Intentional off-task looks were very similar to normal work or reading in the available webcam signals. Try a wider range of realistic distractions or rely on the optional phone alarm for visible phones.");
+  }
+
+  return {
+    baseline,
+    zone,
+    zoneShape,
+    marginPercent: safeMargin,
+    sampleCount: focusedSamples.length + offTaskSamples.length,
+    negativeOverlap,
+    positiveOutside,
+    targetDiagnostics: diagnostics,
+    tuning: trainedTuning,
+    balancedAccuracy,
     warnings,
   };
 }

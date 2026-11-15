@@ -3,13 +3,14 @@ import NotesNotebook, { clearNotebookStorage } from "./NotesNotebook";
 import { DESIGNS, DESIGN_GROUPS, DEFAULT_DESIGN, designById, isDesignId, type DesignId } from "./designs";
 import MotionFx from "./MotionFx";
 import { inkOn, lightnessFor, luminance } from "./accent";
-import { playAttentionWarning, playUi, soundSupported } from "./sound";
+import { playAttentionWarning, playUi, soundSupported, startFocusAlarm, stopFocusAlarm } from "./sound";
 import AttentionGuardPanel, { AttentionCameraIndicator } from "./attention-guard/AttentionGuardPanel";
 import { AttentionGuardController } from "./attention-guard/controller";
-import { isActiveFocusTimer, shouldPauseFocusTimer } from "./attention-guard/lifecycle";
+import { isActiveFocusTimer, shouldPauseFocusTimer, shouldPlayAttentionWarning, shouldRunFocusAlarm } from "./attention-guard/lifecycle";
 import { activeAttentionProfile, clearAttentionStore } from "./attention-guard/storage";
 import { secondsRemaining } from "./timerMath";
 import { useAttentionStore } from "./attention-guard/useAttentionStore";
+import { normalizeCalendarEvents, pruneExpiredCalendarEvents, type CalendarEvent } from "./calendarEvents";
 
 const PdfViewer = lazy(() => import("./PdfViewer"));
 const WebReader = lazy(() => import("./WebReader"));
@@ -69,6 +70,7 @@ type AppState = {
   remaining: number;
   sessionsDone: number;
   tasks: Task[];
+  events: CalendarEvent[];
   activeTaskId: string | null;
   notes: string;
   stats: Record<string, DayStat>;
@@ -329,6 +331,7 @@ const defaultState = (): AppState => ({
   remaining: 25 * 60,
   sessionsDone: 0,
   tasks: [],
+  events: [],
   activeTaskId: null,
   notes: "",
   stats: {},
@@ -502,6 +505,7 @@ function loadState(): AppState {
             scheduledFor: isLocalDateKey(task.scheduledFor) ? task.scheduledFor : undefined,
           }))
         : base.tasks,
+      events: normalizeCalendarEvents(parsed.events, todayKey()),
       windows: { ...(parsed.windows ?? {}) },
       arrangement,
       customArrangements,
@@ -994,6 +998,8 @@ function App() {
   const [taskInput, setTaskInput] = useState("");
   const [taskView, setTaskView] = useState<"tasks" | "planner">("tasks");
   const [plannerDate, setPlannerDate] = useState(() => todayKey());
+  const [plannerAddMode, setPlannerAddMode] = useState<"task" | "event" | null>(null);
+  const [eventInput, setEventInput] = useState("");
   const [spotifyInput, setSpotifyInput] = useState("");
   const [imageInput, setImageInput] = useState("");
   const [youtubeInput, setYoutubeInput] = useState("");
@@ -1029,6 +1035,7 @@ function App() {
   const segmentElapsed = useRef(0);
   const completionLock = useRef(false);
   const completionTimeout = useRef<number | null>(null);
+  const calendarDayKey = useRef(todayKey());
   const timerRunId = useRef(0);
   const pendingAutoStart = useRef(false);
   const totalSessionsCache = useRef<{ sessionsDone: number; value: number } | null>(null);
@@ -1055,11 +1062,37 @@ function App() {
   const attentionStoreRef = useRef(attentionStore);
   attentionStoreRef.current = attentionStore;
   const focusTimerActive = isActiveFocusTimer(running, state.mode);
+  const syncFocusAlarm = useCallback(() => {
+    const runtime = attentionController.getState();
+    const shouldAlarm = shouldRunFocusAlarm({
+      enabled: attentionStoreRef.current.focusAlarmEnabled,
+      offTargetAlertsEnabled: attentionStoreRef.current.offTargetAlertsEnabled,
+      focusTimerActive: isActiveFocusTimer(runningRef.current, stateRef.current.mode),
+      status: runtime.status,
+      runPurpose: runtime.runPurpose,
+      warningLevel: attentionController.getClassification().warningLevel,
+    });
+    if (shouldAlarm) startFocusAlarm();
+    else stopFocusAlarm();
+  }, [attentionController]);
 
   useEffect(() => {
     attentionController.mount();
     return () => attentionController.dispose();
   }, [attentionController]);
+  useEffect(() => {
+    const unsubscribeState = attentionController.subscribeState(syncFocusAlarm);
+    const unsubscribeClassification = attentionController.subscribeClassification(syncFocusAlarm);
+    syncFocusAlarm();
+    return () => {
+      unsubscribeState();
+      unsubscribeClassification();
+      stopFocusAlarm();
+    };
+  }, [attentionController, syncFocusAlarm]);
+  useEffect(() => {
+    syncFocusAlarm();
+  }, [syncFocusAlarm, focusTimerActive, attentionStore.focusAlarmEnabled, attentionStore.offTargetAlertsEnabled]);
   useEffect(() => () => {
     if (toastTimeout.current != null) window.clearTimeout(toastTimeout.current);
     if (completionTimeout.current != null) window.clearTimeout(completionTimeout.current);
@@ -1072,10 +1105,27 @@ function App() {
     if (!runningRef.current || liveState.mode !== "focus") return;
 
     const preferences = attentionStoreRef.current;
+    if (intervention.reason === "phone-detected") {
+      if (shouldPlayAttentionWarning({
+        soundEnabled: preferences.soundEnabled,
+        focusAlarmEnabled: preferences.focusAlarmEnabled,
+        offTargetAlertsEnabled: preferences.offTargetAlertsEnabled,
+        reason: intervention.reason,
+        level: intervention.level,
+      })) playAttentionWarning(intervention.level);
+      notify("Phone detected in the camera frame. Put it out of sight to keep your Focus session clear.");
+      return;
+    }
     const shouldPause = preferences.offTargetAlertsEnabled
       && shouldPauseFocusTimer(intervention.level, preferences.strictPause, isActiveFocusTimer(runningRef.current, liveState.mode));
     if (intervention.reason !== "screen-break" && !preferences.offTargetAlertsEnabled && !shouldPause) return;
-    if (preferences.soundEnabled) playAttentionWarning(intervention.level);
+    if (shouldPlayAttentionWarning({
+      soundEnabled: preferences.soundEnabled,
+      focusAlarmEnabled: preferences.focusAlarmEnabled,
+      offTargetAlertsEnabled: preferences.offTargetAlertsEnabled,
+      reason: intervention.reason,
+      level: intervention.level,
+    })) playAttentionWarning(intervention.level);
     if (shouldPause) {
       const cause = intervention.reason === "face-not-detected" ? "your face was not visible" : "you were away from your work area";
       notify(`Focus timer paused because ${cause} for a while. Resume when you're ready.`);
@@ -1101,6 +1151,9 @@ function App() {
   useEffect(() => {
     attentionController.setScreenBreakReminderMinutes(attentionStore.screenBreakReminderMinutes);
   }, [attentionController, attentionStore.screenBreakReminderMinutes]);
+  useEffect(() => {
+    attentionController.setPhoneDetectionEnabled(attentionStore.phoneDetectionEnabled);
+  }, [attentionController, attentionStore.phoneDetectionEnabled]);
   useEffect(() => {
     if (attentionController.getState().status === "off") attentionController.selectDevice(attentionStore.cameraDeviceId);
   }, [attentionController, attentionStore.cameraDeviceId]);
@@ -1263,7 +1316,22 @@ function App() {
 
   /* ---- clock + quote rotation ---- */
   useEffect(() => {
-    const id = window.setInterval(() => setClock(new Date()), 15000);
+    const syncClockAndCalendarDate = () => {
+      const now = new Date();
+      setClock(now);
+      const nextDayKey = todayKey(now);
+      if (nextDayKey === calendarDayKey.current) return;
+      calendarDayKey.current = nextDayKey;
+      setState((prev) => {
+        const events = pruneExpiredCalendarEvents(prev.events, nextDayKey);
+        return events.length === prev.events.length ? prev : { ...prev, events };
+      });
+    };
+    const id = window.setInterval(syncClockAndCalendarDate, 15000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) syncClockAndCalendarDate();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // Pick a fresh random quote each rotation (never immediately repeating)
     // so a much larger library feels varied instead of walking in order.
     const quoteId = window.setInterval(() => {
@@ -1277,6 +1345,7 @@ function App() {
     return () => {
       window.clearInterval(id);
       window.clearInterval(quoteId);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
 
@@ -1728,6 +1797,27 @@ function App() {
     setTaskInput("");
   }
 
+  function addPlannerTask() {
+    if (!taskInput.trim()) return;
+    addTask(plannerDate);
+    setPlannerAddMode(null);
+  }
+
+  function addCalendarEvent(date: string) {
+    const title = eventInput.trim();
+    const today = todayKey();
+    if (!title || !isLocalDateKey(date) || date < today) return;
+
+    const event: CalendarEvent = { id: uid(), title, date, createdAt: Date.now() };
+    setState((prev) => ({ ...prev, events: [...prev.events, event] }));
+    setEventInput("");
+    setPlannerAddMode(null);
+  }
+
+  function deleteCalendarEvent(eventId: string) {
+    setState((prev) => ({ ...prev, events: prev.events.filter((event) => event.id !== eventId) }));
+  }
+
   function updateTaskSchedule(taskId: string, scheduledFor: string) {
     const validDate = isLocalDateKey(scheduledFor) ? scheduledFor : undefined;
     setState((prev) => ({
@@ -1779,7 +1869,7 @@ function App() {
   const greeting =
     clock.getHours() < 5 ? "still up" : clock.getHours() < 12 ? "good morning" : clock.getHours() < 17 ? "good afternoon" : clock.getHours() < 22 ? "good evening" : "still up";
 
-  const currentDayKey = todayKey();
+  const currentDayKey = todayKey(clock);
   const sevenDays = useMemo(() => {
     const now = new Date();
     return Array.from({ length: 7 }, (_, index) => {
@@ -1823,6 +1913,14 @@ function App() {
 
     return { byDate, remaining, plannedRemaining };
   }, [state.tasks]);
+  const eventCountsByDate = useMemo(() => {
+    const byDate = new Map<string, number>();
+    for (const event of state.events) {
+      if (event.date < currentDayKey) continue;
+      byDate.set(event.date, (byDate.get(event.date) ?? 0) + 1);
+    }
+    return byDate;
+  }, [state.events, currentDayKey]);
   const plannerMonthDays = useMemo(() => {
     const selected = localDateFromKey(plannerDate);
     const year = selected.getFullYear();
@@ -1856,6 +1954,16 @@ function App() {
     () => localDateFromKey(plannerDate).toLocaleDateString(undefined, { month: "long", year: "numeric" }),
     [plannerDate],
   );
+  useEffect(() => {
+    setPlannerAddMode(null);
+    setEventInput("");
+  }, [plannerDate]);
+  const selectedDayEvents = useMemo(
+    () => state.events
+      .filter((event) => event.date === plannerDate && event.date >= currentDayKey)
+      .sort((a, b) => a.createdAt - b.createdAt),
+    [state.events, plannerDate, currentDayKey],
+  );
   const selectedDayTasks = useMemo(
     () => state.tasks
       .filter((task) => task.scheduledFor === plannerDate)
@@ -1867,6 +1975,7 @@ function App() {
     [selectedDayTasks],
   );
   const selectedDayRemaining = selectedDayTasks.length - selectedDayDone;
+  const canAddEvent = plannerDate >= currentDayKey;
 
   const totalTasks = state.tasks.length;
   const doneTasks = totalTasks - taskCounts.remaining;
@@ -2515,15 +2624,19 @@ function App() {
             <div className="planner-month-grid" role="group" aria-label={`Choose a day in ${plannerMonthLabel}`}>
               {plannerMonthDays.map(({ key, date, inMonth }) => {
                 const counts = taskCounts.byDate.get(key);
-                const isToday = key === todayKey();
-                const detail = counts
-                  ? `${counts.remaining} remaining, ${counts.done} done`
-                  : "No planned tasks";
+                const eventCount = eventCountsByDate.get(key) ?? 0;
+                const hasEvents = eventCount > 0;
+                const isToday = key === currentDayKey;
+                const details = [
+                  counts ? `${counts.remaining} task${counts.remaining === 1 ? "" : "s"} remaining, ${counts.done} done` : "",
+                  hasEvents ? `${eventCount} event${eventCount === 1 ? "" : "s"}` : "",
+                ].filter(Boolean);
+                const detail = details.length ? details.join(", ") : "No planned tasks or events";
                 return (
                   <button
                     key={key}
                     type="button"
-                    className={`planner-day ${plannerDate === key ? "active" : ""} ${isToday ? "is-today" : ""} ${inMonth ? "" : "is-outside"}`}
+                    className={`planner-day ${plannerDate === key ? "active" : ""} ${isToday ? "is-today" : ""} ${inMonth ? "" : "is-outside"} ${hasEvents ? "has-events" : ""}`}
                     data-date={key}
                     aria-pressed={plannerDate === key}
                     aria-current={isToday ? "date" : undefined}
@@ -2531,6 +2644,7 @@ function App() {
                     onClick={() => setPlannerDate(key)}
                   >
                     <span>{date.getDate()}</span>
+                    {hasEvents && <i className="planner-day-event-marker" aria-hidden="true" />}
                     <small>{counts?.remaining ? counts.remaining > 9 ? "9+" : counts.remaining : counts?.done ? "✓" : ""}</small>
                   </button>
                 );
@@ -2541,29 +2655,102 @@ function App() {
                 <strong>{formatLongDate(plannerDate)}</strong>
                 <small>
                   {selectedDayTasks.length === 0
-                    ? "A clear day is room for a win."
+                    ? "No tasks planned"
                     : `${selectedDayRemaining} left · ${selectedDayDone} done`}
                 </small>
               </div>
-              <span className={`planner-day-total ${selectedDayRemaining === 0 && selectedDayDone > 0 ? "is-complete" : ""}`}>
+              <span
+                className={`planner-day-total ${selectedDayRemaining === 0 && selectedDayDone > 0 ? "is-complete" : ""}`}
+                aria-label={`${selectedDayRemaining} tasks remaining`}
+              >
                 {selectedDayRemaining === 0 && selectedDayDone > 0 ? <Icon name="check" /> : selectedDayRemaining}
               </span>
             </div>
-            <div className="add-row planner-add-row">
-              <input
-                aria-label={`Add task for ${formatLongDate(plannerDate)}`}
-                value={taskInput}
-                onChange={(event) => setTaskInput(event.target.value)}
-                onKeyDown={(event) => event.key === "Enter" && addTask(plannerDate)}
-                placeholder="Add a task to this day"
-                maxLength={140}
-              />
-              <button type="button" onClick={() => addTask(plannerDate)} aria-label="Add task to planner"><Icon name="plus" /></button>
+            <div className="planner-create-actions" role="group" aria-label={`Add to ${formatLongDate(plannerDate)}`}>
+              <button
+                type="button"
+                className={plannerAddMode === "task" ? "active" : ""}
+                aria-expanded={plannerAddMode === "task"}
+                aria-controls={plannerAddMode === "task" ? "planner-task-entry" : undefined}
+                onClick={() => setPlannerAddMode((mode) => mode === "task" ? null : "task")}
+              >
+                <Icon name="plus" /><span>Add task</span>
+              </button>
+              <button
+                type="button"
+                className={plannerAddMode === "event" ? "active" : ""}
+                aria-expanded={plannerAddMode === "event"}
+                aria-controls={plannerAddMode === "event" && canAddEvent ? "planner-event-entry" : undefined}
+                disabled={!canAddEvent}
+                title={canAddEvent ? undefined : "Events can only be added for today or a future date"}
+                onClick={() => setPlannerAddMode((mode) => mode === "event" ? null : "event")}
+              >
+                <Icon name="calendar" /><span>Add event</span>
+              </button>
             </div>
-            <p className="planner-sync-note">Plan it here, finish it anywhere — these are the same tasks as your list.</p>
+            {plannerAddMode === "task" && (
+              <form
+                id="planner-task-entry"
+                className="add-row planner-add-row"
+                onSubmit={(event) => { event.preventDefault(); addPlannerTask(); }}
+              >
+                <input
+                  autoFocus
+                  aria-label={`Add task for ${formatLongDate(plannerDate)}`}
+                  value={taskInput}
+                  onChange={(event) => setTaskInput(event.target.value)}
+                  placeholder="Add a task to this day"
+                  maxLength={140}
+                />
+                <button type="submit" disabled={!taskInput.trim()} aria-label={`Add task for ${formatLongDate(plannerDate)}`}><Icon name="plus" /></button>
+              </form>
+            )}
+            {plannerAddMode === "event" && canAddEvent && (
+              <form
+                id="planner-event-entry"
+                className="add-row planner-add-row planner-event-entry"
+                onSubmit={(event) => { event.preventDefault(); addCalendarEvent(plannerDate); }}
+              >
+                <input
+                  autoFocus
+                  aria-label={`Add event for ${formatLongDate(plannerDate)}`}
+                  value={eventInput}
+                  onChange={(event) => setEventInput(event.target.value)}
+                  placeholder="Add an event to this day"
+                  maxLength={140}
+                />
+                <button type="submit" disabled={!eventInput.trim()} aria-label={`Add event for ${formatLongDate(plannerDate)}`}><Icon name="plus" /></button>
+              </form>
+            )}
+            {!canAddEvent && <p className="planner-sync-note planner-event-expiry-note">Events can only be added for today or a future date.</p>}
+            <section className="planner-events" aria-label={`Events for ${formatLongDate(plannerDate)}`}>
+              <div className="planner-section-heading">
+                <strong>Events</strong>
+                {selectedDayEvents.length > 0 && <small>{selectedDayEvents.length}</small>}
+              </div>
+              <div className="planner-event-list" role="list" aria-label={`Events for ${formatLongDate(plannerDate)}`}>
+                {selectedDayEvents.length === 0 && <p className="empty-copy planner-empty" role="listitem">No events for this day.</p>}
+                {selectedDayEvents.map((event) => (
+                  <div className="planner-event-item" role="listitem" key={event.id}>
+                    <span className="planner-event-marker" aria-hidden="true" />
+                    <span className="planner-event-title">{event.title}</span>
+                    <button
+                      type="button"
+                      className="planner-event-delete"
+                      onClick={() => deleteCalendarEvent(event.id)}
+                      aria-label={`Delete event ${event.title}`}
+                      title="Delete event"
+                    >
+                      <Icon name="trash" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+            <p className="planner-sync-note">Plan it here, finish it anywhere — tasks stay in your task list.</p>
             <div className="task-list planner-task-list" role="list" aria-label={`Tasks for ${formatLongDate(plannerDate)}`}>
               {selectedDayTasks.length === 0 && (
-                <p className="empty-copy planner-empty">Nothing planned yet. Add a small win above, or schedule a task from Tasks.</p>
+                <p className="empty-copy planner-empty">No tasks planned for this day. Add one above or schedule a task from Tasks.</p>
               )}
               {selectedDayTasks.map((task) => (
                 <TaskRow

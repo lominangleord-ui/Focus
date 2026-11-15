@@ -27,6 +27,10 @@ export type AttentionStore = {
   cameraDeviceId: string;
   /** In-app reminders for sustained off-target behavior during Focus. */
   offTargetAlertsEnabled: boolean;
+  /** Loud level-2 alarm during Focus when the calibrated zone is left for a sustained period. */
+  focusAlarmEnabled: boolean;
+  /** Optional on-device phone-in-frame alarm during explicit Focus tracking. */
+  phoneDetectionEnabled: boolean;
   soundEnabled: boolean;
   strictPause: boolean;
   /** 0 disables the timed Screen-zone break nudge. */
@@ -70,6 +74,8 @@ export function defaultAttentionStore(): AttentionStore {
     mode: "screen",
     cameraDeviceId: "",
     offTargetAlertsEnabled: true,
+    focusAlarmEnabled: true,
+    phoneDetectionEnabled: false,
     soundEnabled: false,
     strictPause: false,
     screenBreakReminderMinutes: 0,
@@ -162,6 +168,8 @@ export function normalizeAttentionStore(value: unknown): AttentionStore {
     mode: isMode(value.mode) ? value.mode : base.mode,
     cameraDeviceId: typeof value.cameraDeviceId === "string" ? value.cameraDeviceId.slice(0, 512) : "",
     offTargetAlertsEnabled,
+    focusAlarmEnabled: typeof value.focusAlarmEnabled === "boolean" ? value.focusAlarmEnabled : base.focusAlarmEnabled,
+    phoneDetectionEnabled: value.phoneDetectionEnabled === true,
     soundEnabled: value.soundEnabled === true,
     strictPause: value.strictPause === true && offTargetAlertsEnabled,
     screenBreakReminderMinutes: [0, 25, 45, 60].includes(value.screenBreakReminderMinutes as number)

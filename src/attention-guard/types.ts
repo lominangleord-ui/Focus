@@ -28,7 +28,7 @@ export type RawAttentionSignals = {
 
 export type AttentionWarningLevel = 0 | 1 | 2;
 export type AttentionPhase = "waiting" | "needs-calibration" | "attentive" | "drifting" | "away" | "face-missing" | "low-quality";
-export type AttentionReason = "waiting-for-signals" | "profile-not-calibrated" | "within-zone" | "looking-away" | "face-not-detected" | "lighting-too-low" | "face-too-small" | "insufficient-signals" | "screen-break";
+export type AttentionReason = "waiting-for-signals" | "profile-not-calibrated" | "within-zone" | "looking-away" | "face-not-detected" | "lighting-too-low" | "face-too-small" | "insufficient-signals" | "screen-break" | "phone-detected";
 
 export type AttentionClassification = {
   phase: AttentionPhase;
@@ -63,12 +63,22 @@ export type GuardRuntimeState = {
   activeDeviceId: string;
   runPurpose: GuardRunPurpose | null;
   startupStage: GuardStartupStage;
+  phoneDetectionStatus: "off" | "loading" | "ready" | "error";
+  phoneDetectionError: string;
 };
 
 export type WorkerInitMessage = {
   type: "init";
   modelUrl: string;
   wasmBaseUrl: string;
+  phoneDetectorModelUrl: string;
+  phoneDetectorWasmBaseUrl: string;
+  phoneDetectionEnabled: boolean;
+};
+
+export type WorkerPhoneDetectionMessage = {
+  type: "phone-detection";
+  enabled: boolean;
 };
 
 export type WorkerFrameMessage = {
@@ -80,9 +90,11 @@ export type WorkerFrameMessage = {
 
 export type WorkerDisposeMessage = { type: "dispose" };
 
-export type AttentionWorkerRequest = WorkerInitMessage | WorkerFrameMessage | WorkerDisposeMessage;
+export type AttentionWorkerRequest = WorkerInitMessage | WorkerPhoneDetectionMessage | WorkerFrameMessage | WorkerDisposeMessage;
 
 export type AttentionWorkerResponse =
   | { type: "ready" }
+  | { type: "phone-detection-state"; status: "off" | "loading" | "ready" | "error"; message?: string }
+  | { type: "phone-detection-result"; detectedAt: number; confidence: number }
   | { type: "signals"; frameId: number; signals: RawAttentionSignals }
   | { type: "error"; message: string };

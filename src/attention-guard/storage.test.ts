@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createAttentionProfile } from "./profile";
-import { ATTENTION_STORE_KEY, defaultAttentionStore, loadAttentionStore, normalizeAttentionStore, saveAttentionStore } from "./storage";
+import { ATTENTION_STORE_KEY, activeAttentionProfile, defaultAttentionStore, loadAttentionStore, normalizeAttentionStore, saveAttentionStore, upsertAttentionProfile } from "./storage";
 
 class MemoryStorage {
   private values = new Map<string, string>();
@@ -10,9 +10,11 @@ class MemoryStorage {
 }
 
 describe("Attention Guard local store", () => {
-  it("defaults to gentle in-app reminders with stronger interventions opt-in", () => {
+  it("defaults to off-target reminders and a loud level-2 alarm while keeping phone detection off", () => {
     const store = defaultAttentionStore();
     expect(store.offTargetAlertsEnabled).toBe(true);
+    expect(store.focusAlarmEnabled).toBe(true);
+    expect(store.phoneDetectionEnabled).toBe(false);
     expect(store.soundEnabled).toBe(false);
     expect(store.strictPause).toBe(false);
     expect(store.screenBreakReminderMinutes).toBe(0);
@@ -31,9 +33,28 @@ describe("Attention Guard local store", () => {
     expect(loadAttentionStore(storage).cameraDeviceId).toBe("");
   });
 
+  it("persists a calibrated profile and its aggregate sample count", () => {
+    const storage = new MemoryStorage();
+    const profile = createAttentionProfile("screen", "Study desk", "default-screen", 10);
+    profile.calibratedAt = 20;
+    profile.calibrationSamples = 146;
+    profile.baseline = { yawDeg: 1, pitchDeg: -2, rollDeg: 0.5, gazeX: 0.08, gazeY: -0.04 };
+    profile.negativeOverlap = 0.03;
+    const store = upsertAttentionProfile(defaultAttentionStore(), profile);
+
+    expect(saveAttentionStore(store, storage)).toBe(true);
+    expect(activeAttentionProfile(loadAttentionStore(storage))).toMatchObject({
+      calibratedAt: 20,
+      calibrationSamples: 146,
+      baseline: profile.baseline,
+      negativeOverlap: 0.03,
+    });
+  });
+
   it("normalizes reminder and timed break preferences while preserving legacy behavior", () => {
     const legacy = normalizeAttentionStore({ schemaVersion: 1, strictPause: true });
     expect(legacy.offTargetAlertsEnabled).toBe(true);
+    expect(legacy.focusAlarmEnabled).toBe(true);
     expect(legacy.strictPause).toBe(true);
     expect(legacy.screenBreakReminderMinutes).toBe(0);
 
@@ -43,8 +64,12 @@ describe("Attention Guard local store", () => {
       strictPause: true,
       screenBreakReminderMinutes: 45,
     });
-    expect(configured).toMatchObject({ offTargetAlertsEnabled: true, strictPause: true, screenBreakReminderMinutes: 45 });
+    expect(configured).toMatchObject({ offTargetAlertsEnabled: true, focusAlarmEnabled: true, strictPause: true, screenBreakReminderMinutes: 45 });
+    expect(normalizeAttentionStore({ schemaVersion: 1, focusAlarmEnabled: false }).focusAlarmEnabled).toBe(false);
+    expect(normalizeAttentionStore({ schemaVersion: 1, focusAlarmEnabled: "yes" }).focusAlarmEnabled).toBe(true);
     expect(normalizeAttentionStore({ schemaVersion: 1, screenBreakReminderMinutes: 90 }).screenBreakReminderMinutes).toBe(0);
+    expect(normalizeAttentionStore({ schemaVersion: 1, phoneDetectionEnabled: true }).phoneDetectionEnabled).toBe(true);
+    expect(normalizeAttentionStore({ schemaVersion: 1, phoneDetectionEnabled: "yes" }).phoneDetectionEnabled).toBe(false);
     expect(normalizeAttentionStore({ schemaVersion: 1, offTargetAlertsEnabled: false, strictPause: true }).strictPause).toBe(false);
   });
 

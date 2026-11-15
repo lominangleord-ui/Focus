@@ -5,14 +5,19 @@
    bubblegum button pops, deco rings a small bell.
 
    The context is created lazily on the first gesture (browsers refuse to start
-   audio before one) and every voice is deliberately quiet: this is a tick, not
-   a soundtrack. */
+   audio before one) and every interface voice is deliberately quiet: this is a
+   tick, not a soundtrack. Attention Guard's separately controlled, default-on
+   sustained-focus siren uses a separate higher-volume path. */
 
 type Ctor = typeof AudioContext;
 
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
 let noiseBuffer: AudioBuffer | null = null;
+let focusAlarmOscillator: OscillatorNode | null = null;
+let focusAlarmModulator: OscillatorNode | null = null;
+let focusAlarmModulationGain: GainNode | null = null;
+let focusAlarmGain: GainNode | null = null;
 
 function audio(): AudioContext | null {
   if (typeof window === "undefined") return null;
@@ -21,16 +26,18 @@ function audio(): AudioContext | null {
   if (!AC) return null;
   if (!ctx) {
     try {
-      ctx = new AC();
+      const nextContext = new AC();
+      const nextMaster = nextContext.createGain();
+      // Quiet by design — peaks below are 0.02–0.09 before this.
+      nextMaster.gain.value = 0.5;
+      nextMaster.connect(nextContext.destination);
+      ctx = nextContext;
+      master = nextMaster;
     } catch {
       return null;
     }
-    master = ctx.createGain();
-    // Quiet by design — peaks below are 0.02–0.09 before this.
-    master.gain.value = 0.5;
-    master.connect(ctx.destination);
   }
-  if (ctx.state === "suspended") void ctx.resume();
+  if (ctx.state === "suspended") void ctx.resume().catch(() => undefined);
   return ctx;
 }
 
@@ -175,6 +182,148 @@ export function playUi(design: string, kind: UiSoundKind = "tap") {
 /** Prepare the audio context from the user's explicit sound-preference gesture. */
 export function prepareAttentionWarningAudio() {
   audio();
+}
+
+/** Unlock Web Audio from the explicit Focus-tracking start or alarm-setting gesture. */
+export function prepareFocusAlarmAudio() {
+  audio();
+}
+
+/** Start a sustained, pitch-wavering alarm for a level-2 off-target state. */
+export function startFocusAlarm() {
+  const c = audio();
+  if (!c || focusAlarmOscillator) return;
+
+  let oscillator: OscillatorNode | null = null;
+  let gain: GainNode | null = null;
+  let modulator: OscillatorNode | null = null;
+  let modulationGain: GainNode | null = null;
+  try {
+    const at = c.currentTime + 0.02;
+    oscillator = c.createOscillator();
+    gain = c.createGain();
+    modulator = c.createOscillator();
+    modulationGain = c.createGain();
+
+    oscillator.type = "sawtooth";
+    oscillator.frequency.setValueAtTime(820, at);
+    modulator.type = "sine";
+    modulator.frequency.setValueAtTime(1.5, at);
+    modulationGain.gain.setValueAtTime(230, at);
+    modulator.connect(modulationGain);
+    modulationGain.connect(oscillator.frequency);
+
+    // Keep the unscheduled value quiet too, so a warning that clears during
+    // the short scheduling lead-in cannot briefly jump to full volume.
+    gain.gain.value = 0.0001;
+    // The dedicated direct-to-output bus is deliberately much louder than the
+    // optional soft reminder chime, while keeping the peak below full scale.
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(0.17, at + 0.08);
+    oscillator.connect(gain);
+    gain.connect(c.destination);
+    oscillator.start(at);
+    modulator.start(at);
+
+    focusAlarmOscillator = oscillator;
+    focusAlarmGain = gain;
+    focusAlarmModulator = modulator;
+    focusAlarmModulationGain = modulationGain;
+  } catch {
+    try { oscillator?.stop(); } catch { /* oscillator never started */ }
+    try { modulator?.stop(); } catch { /* modulator never started */ }
+    oscillator?.disconnect();
+    modulator?.disconnect();
+    gain?.disconnect();
+    modulationGain?.disconnect();
+    focusAlarmOscillator = null;
+    focusAlarmGain = null;
+    focusAlarmModulator = null;
+    focusAlarmModulationGain = null;
+  }
+}
+
+/** Play a short copy of the siren from a user gesture to verify browser audio. */
+export function playFocusAlarmTest() {
+  const c = audio();
+  if (!c || focusAlarmOscillator) return;
+
+  let oscillator: OscillatorNode | null = null;
+  let gain: GainNode | null = null;
+  let modulator: OscillatorNode | null = null;
+  let modulationGain: GainNode | null = null;
+  try {
+    const at = c.currentTime + 0.02;
+    const endAt = at + 1.35;
+    oscillator = c.createOscillator();
+    gain = c.createGain();
+    modulator = c.createOscillator();
+    modulationGain = c.createGain();
+    oscillator.type = "sawtooth";
+    oscillator.frequency.setValueAtTime(820, at);
+    modulator.type = "sine";
+    modulator.frequency.setValueAtTime(1.5, at);
+    modulationGain.gain.setValueAtTime(230, at);
+    modulator.connect(modulationGain);
+    modulationGain.connect(oscillator.frequency);
+    gain.gain.value = 0.0001;
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(0.17, at + 0.08);
+    gain.gain.setValueAtTime(0.17, endAt - 0.14);
+    gain.gain.exponentialRampToValueAtTime(0.0001, endAt - 0.04);
+    oscillator.connect(gain);
+    gain.connect(c.destination);
+    oscillator.start(at);
+    modulator.start(at);
+    oscillator.stop(endAt);
+    modulator.stop(endAt);
+    oscillator.onended = () => {
+      oscillator?.disconnect();
+      modulator?.disconnect();
+      gain?.disconnect();
+      modulationGain?.disconnect();
+    };
+  } catch {
+    try { oscillator?.stop(); } catch { /* oscillator never started */ }
+    try { modulator?.stop(); } catch { /* modulator never started */ }
+    oscillator?.disconnect();
+    modulator?.disconnect();
+    gain?.disconnect();
+    modulationGain?.disconnect();
+  }
+}
+
+/** Fade the siren out once Attention Guard clears the sustained warning. */
+export function stopFocusAlarm() {
+  const c = ctx;
+  const oscillator = focusAlarmOscillator;
+  const modulator = focusAlarmModulator;
+  const gain = focusAlarmGain;
+  const modulationGain = focusAlarmModulationGain;
+  focusAlarmOscillator = null;
+  focusAlarmModulator = null;
+  focusAlarmGain = null;
+  focusAlarmModulationGain = null;
+
+  if (!c || !oscillator || !gain) return;
+  const at = c.currentTime;
+  try {
+    gain.gain.cancelScheduledValues(at);
+    gain.gain.setTargetAtTime(0.0001, at, 0.025);
+    oscillator.stop(at + 0.12);
+    modulator?.stop(at + 0.12);
+    oscillator.onended = () => oscillator.disconnect();
+    if (modulator) modulator.onended = () => modulator.disconnect();
+    window.setTimeout(() => {
+      gain.disconnect();
+      modulationGain?.disconnect();
+    }, 200);
+  } catch {
+    oscillator.disconnect();
+    modulator?.disconnect();
+    gain.disconnect();
+    modulationGain?.disconnect();
+  }
 }
 
 /** A quiet in-app alert used only when an opted-in focus intervention fires. */
